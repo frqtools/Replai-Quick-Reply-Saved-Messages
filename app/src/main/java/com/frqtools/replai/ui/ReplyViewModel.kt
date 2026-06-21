@@ -12,6 +12,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 
 class ReplyViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -42,6 +44,381 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     fun setReplySortOrder(order: String) {
         _replySortOrder.value = order
         prefs.edit().putString("reply_sort_order", order).apply()
+    }
+
+    // Sheet connection states
+    val isSyncing = MutableStateFlow(false)
+
+    // Data structure for Sheet row / entry
+    data class SheetRow(
+        val category: String,
+        val title: String,
+        val content: String,
+        val isAi: Boolean
+    )
+
+    // Remote URL / Google Sheets Sync State Variables
+    private val _remoteUrlSyncUrl = MutableStateFlow(prefs.getString("remote_url_sync_url", "") ?: "")
+    val remoteUrlSyncUrl: StateFlow<String> = _remoteUrlSyncUrl.asStateFlow()
+
+    private val _remoteUrlSyncAppend = MutableStateFlow(prefs.getBoolean("remote_url_sync_append", false))
+    val remoteUrlSyncAppend: StateFlow<Boolean> = _remoteUrlSyncAppend.asStateFlow()
+
+    private val _remoteUrlLastSyncTime = MutableStateFlow(prefs.getLong("remote_url_last_sync_time", 0L))
+    val remoteUrlLastSyncTime: StateFlow<Long> = _remoteUrlLastSyncTime.asStateFlow()
+
+    private val _remoteUrlSyncStatus = MutableStateFlow(prefs.getString("remote_url_sync_status", "Not Connected") ?: "Not Connected")
+    val remoteUrlSyncStatus: StateFlow<String> = _remoteUrlSyncStatus.asStateFlow()
+
+    fun setRemoteUrlSyncSettings(url: String, append: Boolean) {
+        _remoteUrlSyncUrl.value = url.trim()
+        _remoteUrlSyncAppend.value = append
+        prefs.edit()
+            .putString("remote_url_sync_url", url.trim())
+            .putBoolean("remote_url_sync_append", append)
+            .apply()
+    }
+
+    fun updateRemoteUrlSyncStatus(status: String) {
+        _remoteUrlSyncStatus.value = status
+        prefs.edit().putString("remote_url_sync_status", status).apply()
+    }
+
+    fun updateRemoteUrlLastSyncTime(timestamp: Long) {
+        _remoteUrlLastSyncTime.value = timestamp
+        prefs.edit().putLong("remote_url_last_sync_time", timestamp).apply()
+    }
+
+    private fun markLocalUpdate() {
+        val currentTime = System.currentTimeMillis()
+        prefs.edit().putLong("gdrive_last_local_update_time", currentTime).apply()
+        
+        val syncUrl = _remoteUrlSyncUrl.value.trim()
+        if (syncUrl.isNotBlank() && syncUrl.contains("script.google.com")) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val localCategories = database.categoryDao().getAllCategories().first()
+                    val localReplies = database.replyDao().getAllReplies().first()
+                    val rows = localReplies.mapNotNull { reply ->
+                        localCategories.find { it.id == reply.categoryId }?.let { category ->
+                            SheetRow(
+                                category = category.name,
+                                title = reply.title,
+                                content = reply.content,
+                                isAi = reply.isAiPrompt
+                            )
+                        }
+                    }
+                    writeRemoteRows(syncUrl, rows)
+                } catch (e: Exception) {
+                    Log.e("SheetSync", "Auto-sync update failed", e)
+                }
+            }
+        }
+    }
+
+    private fun mergeRows(local: List<SheetRow>, remote: List<SheetRow>): List<SheetRow> {
+        val merged = mutableListOf<SheetRow>()
+        val seenKeys = mutableSetOf<String>()
+
+        // 1. Add remote rows
+        for (row in remote) {
+            val key = "${row.category.lowercase().trim()}|||${row.title.lowercase().trim()}|||${row.content.lowercase().trim()}"
+            if (!seenKeys.contains(key)) {
+                seenKeys.add(key)
+                merged.add(row)
+            }
+        }
+
+        // 2. Add local rows that are not in remote
+        for (row in local) {
+            val key = "${row.category.lowercase().trim()}|||${row.title.lowercase().trim()}|||${row.content.lowercase().trim()}"
+            if (!seenKeys.contains(key)) {
+                seenKeys.add(key)
+                merged.add(row)
+            }
+        }
+        return merged
+    }
+
+    private suspend fun fetchRemoteRows(url: String): List<SheetRow> {
+        var downloadUrl = url.trim()
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
+        if (downloadUrl.contains("docs.google.com/spreadsheets")) {
+            val regex = "/d/([a-zA-Z0-9-_]+)".toRegex()
+            val match = regex.find(downloadUrl)
+            val sheetId = match?.groups?.get(1)?.value
+            if (sheetId != null) {
+                downloadUrl = "https://docs.google.com/spreadsheets/d/$sheetId/export?format=csv"
+            }
+        }
+
+        val request = okhttp3.Request.Builder().url(downloadUrl).build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw Exception("HTTP Error ${response.code}")
+            }
+            val body = response.body?.string() ?: return emptyList()
+            val trimmedBody = body.trim()
+
+            if (trimmedBody.startsWith("[") || trimmedBody.startsWith("{")) {
+                val list = mutableListOf<SheetRow>()
+                try {
+                    val jsonArray = if (trimmedBody.startsWith("{")) {
+                        val obj = JSONObject(trimmedBody)
+                        obj.optJSONArray("data") ?: JSONArray()
+                    } else {
+                        JSONArray(trimmedBody)
+                    }
+
+                    for (i in 0 until jsonArray.length()) {
+                        val obj = jsonArray.getJSONObject(i)
+                        val cat = obj.optString("category", "").trim()
+                        val title = obj.optString("title", "").trim()
+                        val content = obj.optString("content", "").trim()
+                        val isAi = obj.optBoolean("isAi", false) || 
+                                   obj.optString("type", "").lowercase().contains("ai") ||
+                                   obj.optBoolean("isAiPrompt", false)
+                        if (cat.isNotEmpty() && content.isNotEmpty()) {
+                            list.add(SheetRow(category = cat, title = title, content = content, isAi = isAi))
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("SheetSync", "Parse response JSON failure", e)
+                }
+                return list
+            } else {
+                val records = parseFullCsv(body)
+                if (records.isEmpty()) return emptyList()
+
+                var categoryIndex = 0
+                var titleIndex = -1
+                var contentIndex = -1
+                var isAiIndex = -1
+
+                val firstRecord = records[0]
+                var hasHeader = false
+                if (firstRecord.any { it.equals("category", ignoreCase = true) || it.equals("title", ignoreCase = true) || it.equals("content", ignoreCase = true) }) {
+                    hasHeader = true
+                    categoryIndex = firstRecord.indexOfFirst { it.equals("category", ignoreCase = true) }.coerceAtLeast(0)
+                    titleIndex = firstRecord.indexOfFirst { it.equals("title", ignoreCase = true) }
+                    contentIndex = firstRecord.indexOfFirst { it.equals("content", ignoreCase = true) }
+                    isAiIndex = firstRecord.indexOfFirst { it.equals("type", ignoreCase = true) || it.equals("isai", ignoreCase = true) || it.equals("is_ai", ignoreCase = true) || it.equals("isaiprompt", ignoreCase = true) }
+                }
+
+                if (titleIndex == -1) titleIndex = 1
+                if (contentIndex == -1) contentIndex = 2
+                if (isAiIndex == -1) isAiIndex = 3
+
+                val startRow = if (hasHeader) 1 else 0
+                val list = mutableListOf<SheetRow>()
+
+                for (idx in startRow until records.size) {
+                    val cells = records[idx]
+                    if (cells.size <= 1) continue
+
+                    val categoryName = cells.getOrNull(categoryIndex)?.trim() ?: ""
+                    val title = cells.getOrNull(titleIndex)?.trim() ?: "Template $idx"
+                    val content = cells.getOrNull(contentIndex)?.trim() ?: ""
+                    val isAiVal = if (isAiIndex >= 0) cells.getOrNull(isAiIndex)?.trim() else null
+                    val isAi = isAiVal?.equals("true", ignoreCase = true) == true || 
+                               isAiVal?.equals("ai", ignoreCase = true) == true || 
+                               isAiVal?.equals("1") == true
+
+                    if (categoryName.isNotBlank() && content.isNotBlank()) {
+                        list.add(SheetRow(category = categoryName, title = title, content = content, isAi = isAi))
+                    }
+                }
+                return list
+            }
+        }
+    }
+
+    private suspend fun writeRemoteRows(url: String, rows: List<SheetRow>): Boolean {
+        if (!url.contains("script.google.com")) return false
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
+        val jsonArray = JSONArray()
+        for (row in rows) {
+            val obj = JSONObject()
+            obj.put("category", row.category)
+            obj.put("title", row.title)
+            obj.put("content", row.content)
+            obj.put("isAi", row.isAi)
+            obj.put("type", if (row.isAi) "ai" else "template")
+            jsonArray.put(obj)
+        }
+
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val body = jsonArray.toString().toRequestBody(mediaType)
+
+        val request = okhttp3.Request.Builder()
+            .url(url)
+            .post(body)
+            .build()
+
+        return try {
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.e("SheetSync", "Failed to upload sheet rows", e)
+            false
+        }
+    }
+
+    suspend fun performBidirectionalSync(forceUrl: String? = null, onFinished: ((Boolean, String) -> Unit)? = null) = withContext(Dispatchers.IO) {
+        val syncUrl = forceUrl ?: _remoteUrlSyncUrl.value.trim()
+        if (syncUrl.isBlank()) {
+            updateRemoteUrlSyncStatus("Config Error: Sync URL is empty.")
+            onFinished?.invoke(false, "Sync URL is empty")
+            return@withContext
+        }
+
+        if (isSyncing.value) {
+            onFinished?.invoke(false, "Sync already in progress")
+            return@withContext
+        }
+        isSyncing.value = true
+        updateRemoteUrlSyncStatus("Synchronizing...")
+
+        try {
+            // 1. Get all local data
+            val localCategories = database.categoryDao().getAllCategories().first()
+            val localReplies = database.replyDao().getAllReplies().first()
+            
+            val localRows = localReplies.mapNotNull { reply ->
+                localCategories.find { it.id == reply.categoryId }?.let { category ->
+                    SheetRow(
+                        category = category.name,
+                        title = reply.title,
+                        content = reply.content,
+                        isAi = reply.isAiPrompt
+                    )
+                }
+            }
+
+            // 2. Fetch remote data
+            val remoteRows = fetchRemoteRows(syncUrl)
+
+            // 3. Bidirectional merge (preventing washouts!)
+            val append = _remoteUrlSyncAppend.value
+            val mergedRows = if (append) {
+                mergeRows(localRows, remoteRows)
+            } else {
+                // If append is false, we still don't washout! We just consolidate them both ways.
+                mergeRows(localRows, remoteRows)
+            }
+
+            // 4. Update the local Room database to match
+            database.replyDao().deleteAllReplies()
+            database.categoryDao().deleteAllCategories()
+
+            val createdCategories = mutableMapOf<String, Long>()
+            var orderIdx = 0
+            for (row in mergedRows) {
+                var categoryId = createdCategories[row.category.lowercase().trim()]
+                if (categoryId == null) {
+                    categoryId = database.categoryDao().insertCategory(
+                        Category(
+                            name = row.category.trim(),
+                            iconName = if (row.isAi) "psychology" else "folder",
+                            orderIndex = orderIdx++,
+                            isForAi = row.isAi
+                        )
+                    )
+                    createdCategories[row.category.lowercase().trim()] = categoryId
+                }
+                database.replyDao().insertReply(
+                    Reply(
+                        categoryId = categoryId,
+                        title = row.title.trim(),
+                        content = row.content.trim(),
+                        isAiPrompt = row.isAi
+                    )
+                )
+            }
+
+            // 5. If it is a script.google.com URL, push the merged dataset back to Sheets
+            var uploaded = false
+            if (syncUrl.contains("script.google.com")) {
+                uploaded = writeRemoteRows(syncUrl, mergedRows)
+            }
+
+            val timestamp = System.currentTimeMillis()
+            updateRemoteUrlLastSyncTime(timestamp)
+            val statusText = if (uploaded) {
+                "Synced bi-directionally (${mergedRows.size} total items)"
+            } else {
+                "Synced (Read-only, ${mergedRows.size} total items)"
+            }
+            updateRemoteUrlSyncStatus(statusText)
+            _toastMessage.emit("Sync complete! Consolidated ${mergedRows.size} items. 🚀")
+            onFinished?.invoke(true, statusText)
+        } catch (e: Exception) {
+            Log.e("SheetSync", "Failed to sync", e)
+            val errMsg = "Failed: ${e.message}"
+            updateRemoteUrlSyncStatus(errMsg)
+            onFinished?.invoke(false, errMsg)
+        } finally {
+            isSyncing.value = false
+        }
+    }
+
+    suspend fun restoreDatabaseFromJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val root = JSONObject(jsonString)
+            if (!root.has("app") || root.getString("app") != "Replai") {
+                return@withContext false
+            }
+
+            // Clear out replies and categories for an exact sync override
+            database.replyDao().deleteAllReplies()
+            database.categoryDao().deleteAllCategories()
+
+            val dataArray = root.getJSONArray("data")
+            for (i in 0 until dataArray.length()) {
+                val catObj = dataArray.getJSONObject(i)
+                val catName = catObj.getString("name")
+                val catIcon = catObj.optString("iconName", "folder")
+                val catOrder = catObj.optInt("orderIndex", 0)
+                val catIsForAi = catObj.optBoolean("isForAi", false)
+
+                val categoryId = database.categoryDao().insertCategory(
+                    Category(name = catName, iconName = catIcon, orderIndex = catOrder, isForAi = catIsForAi)
+                )
+
+                val repliesArray = catObj.getJSONArray("replies")
+                for (j in 0 until repliesArray.length()) {
+                    val replyObj = repliesArray.getJSONObject(j)
+                    val rTitle = replyObj.getString("title")
+                    val rContent = replyObj.getString("content")
+                    val rCount = replyObj.optInt("usageCount", 0)
+                    val rIsAi = replyObj.optBoolean("isAiPrompt", false)
+
+                    database.replyDao().insertReply(
+                        Reply(
+                            categoryId = categoryId,
+                            title = rTitle,
+                            content = rContent,
+                            usageCount = rCount,
+                            isAiPrompt = rIsAi
+                        )
+                    )
+                }
+            }
+            return@withContext true
+        } catch (e: Exception) {
+            Log.e("ReplyViewModel", "Restore failed", e)
+            return@withContext false
+        }
     }
 
     // All categories flow, with dynamic sorting applied
@@ -100,6 +477,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
             val maxOrder = categories.value.maxOfOrNull { it.orderIndex } ?: 0
             repository.insertCategory(Category(name = name, iconName = iconName, orderIndex = maxOrder + 1, isForAi = isForAi))
             _toastMessage.emit("Category '$name' created")
+            markLocalUpdate()
         }
     }
 
@@ -107,6 +485,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.updateCategory(category.copy(name = newName, iconName = newIcon, isForAi = isForAi))
             _toastMessage.emit("Category updated")
+            markLocalUpdate()
         }
     }
 
@@ -116,6 +495,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 repository.updateCategory(category)
             }
             _toastMessage.emit("Category order updated")
+            markLocalUpdate()
         }
     }
 
@@ -123,6 +503,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.deleteCategory(category)
             _toastMessage.emit("Category '${category.name}' deleted")
+            markLocalUpdate()
         }
     }
 
@@ -138,6 +519,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 )
             )
             _toastMessage.emit("Reply '$title' saved")
+            markLocalUpdate()
         }
     }
 
@@ -152,6 +534,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 )
             )
             _toastMessage.emit("Reply '$title' updated")
+            markLocalUpdate()
         }
     }
 
@@ -159,6 +542,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.deleteReply(reply)
             _toastMessage.emit("Reply '${reply.title}' deleted")
+            markLocalUpdate()
         }
     }
 
@@ -172,6 +556,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 _toastMessage.emit("Deleted ${replyIds.size} templates")
+                markLocalUpdate()
             } catch (e: Exception) {
                 _toastMessage.emit("Failed to delete templates")
             }
@@ -181,6 +566,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     fun incrementUsage(replyId: Long) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.incrementUsageCount(replyId)
+            markLocalUpdate()
         }
     }
 
@@ -332,6 +718,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (count > 0) {
                 _toastMessage.emit("Successfully imported $count templates! 🚀")
+                markLocalUpdate()
             } else {
                 _toastMessage.emit("No valid templates found to import")
             }
@@ -433,5 +820,51 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
             _toastMessage.emit("Failed to import backup: invalid JSON format.")
             return@withContext false
         }
+    }
+
+
+
+    private fun parseFullCsv(body: String): List<List<String>> {
+        val result = mutableListOf<List<String>>()
+        var currentRecord = mutableListOf<String>()
+        val currentField = StringBuilder()
+        var inQuotes = false
+        var i = 0
+        val len = body.length
+
+        while (i < len) {
+            val c = body[i]
+            if (c == '"') {
+                if (i + 1 < len && body[i + 1] == '"') {
+                    currentField.append('"')
+                    i++
+                } else {
+                    inQuotes = !inQuotes
+                }
+            } else if (c == ',' && !inQuotes) {
+                currentRecord.add(currentField.toString())
+                currentField.setLength(0)
+            } else if ((c == '\n' || c == '\r') && !inQuotes) {
+                if (c == '\r' && i + 1 < len && body[i + 1] == '\n') {
+                    i++
+                }
+                currentRecord.add(currentField.toString())
+                currentField.setLength(0)
+                if (currentRecord.isNotEmpty() && currentRecord.any { it.isNotBlank() }) {
+                    result.add(currentRecord)
+                }
+                currentRecord = mutableListOf()
+            } else {
+                currentField.append(c)
+            }
+            i++
+        }
+        if (currentField.isNotEmpty() || currentRecord.isNotEmpty()) {
+            currentRecord.add(currentField.toString())
+            if (currentRecord.any { it.isNotBlank() }) {
+                result.add(currentRecord)
+            }
+        }
+        return result
     }
 }

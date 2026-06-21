@@ -4,8 +4,11 @@ package com.frqtools.replai
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
+import android.app.Activity
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -49,6 +52,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.frqtools.replai.data.Category
 import com.frqtools.replai.data.Reply
@@ -56,10 +60,11 @@ import com.frqtools.replai.ui.ReplyViewModel
 import com.frqtools.replai.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.path
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -220,6 +225,9 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
     var activeTab by remember { mutableIntStateOf(0) } // 0 = Saved Replies, 1 = AI Prompts, 2 = Settings
     var activeCategoryFilter by remember { mutableStateOf<Category?>(null) }
 
+    val context = LocalContext.current
+    var showCloudSyncDialog by remember { mutableStateOf(false) }
+
     LaunchedEffect(activeTab) {
         activeCategoryFilter = null
     }
@@ -265,7 +273,6 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
     // Variable interpolation prompt controller
     var activeVariableReply by remember { mutableStateOf<Reply?>(null) }
 
-    val context = LocalContext.current
     val systemClipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
     /**
@@ -365,7 +372,18 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 .padding(innerPadding)
         ) {
             // Elegant top branding status bar
-            TopBrandHeader(replies = replies)
+            TopBrandHeader(
+                replies = replies,
+                viewModel = viewModel,
+                onCloudClick = { showCloudSyncDialog = true }
+            )
+
+            if (showCloudSyncDialog) {
+                CloudSyncDialog(
+                    viewModel = viewModel,
+                    onDismiss = { showCloudSyncDialog = false }
+                )
+            }
 
             // Multi-Select Banner overlay
             AnimatedVisibility(
@@ -718,7 +736,15 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
  * Top brand Header block.
  */
 @Composable
-fun TopBrandHeader(replies: List<Reply>) {
+fun TopBrandHeader(
+    replies: List<Reply>,
+    viewModel: ReplyViewModel,
+    onCloudClick: () -> Unit
+) {
+    val sheetUrl by viewModel.remoteUrlSyncUrl.collectAsState()
+    val isConnected = sheetUrl.isNotBlank()
+    val isSyncing by viewModel.isSyncing.collectAsState()
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -761,8 +787,407 @@ fun TopBrandHeader(replies: List<Reply>) {
                     fontWeight = FontWeight.Medium
                 )
             }
+
+            // Cloud Sync Icon Button at top right
+            IconButton(
+                onClick = onCloudClick,
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(
+                        if (isConnected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                        shape = CircleShape
+                    )
+            ) {
+                if (isSyncing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                } else {
+                    Icon(
+                        imageVector = if (isConnected) GDriveIcons.CloudDone else GDriveIcons.CloudQueue,
+                        contentDescription = "Cloud backup settings",
+                        tint = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
     }
+}
+
+@Composable
+fun CloudSyncDialog(
+    viewModel: ReplyViewModel,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    
+    var selectedTab by remember { mutableStateOf(0) }
+    val tabs = listOf("Sheets Link", "Manual Backup")
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = GDriveIcons.Cloud,
+                    contentDescription = "Cloud backup",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(28.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Backup & Template Sync",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                TabRow(
+                    selectedTabIndex = selectedTab,
+                    containerColor = Color.Transparent,
+                    contentColor = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                ) {
+                    tabs.forEachIndexed { index, title ->
+                        Tab(
+                            selected = selectedTab == index,
+                            onClick = { selectedTab = index },
+                            text = { Text(title, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
+                        )
+                    }
+                }
+
+                when (selectedTab) {
+                    0 -> {
+                        // Google Sheets Link Import / Sync Tab
+                        val remoteUrl by viewModel.remoteUrlSyncUrl.collectAsState()
+                        val remoteAppend by viewModel.remoteUrlSyncAppend.collectAsState()
+                        val remoteLastSync by viewModel.remoteUrlLastSyncTime.collectAsState()
+                        val remoteStatus by viewModel.remoteUrlSyncStatus.collectAsState()
+
+                        var sheetUrlInput by remember { mutableStateOf(remoteUrl) }
+                        var appendDataInput by remember { mutableStateOf(remoteAppend) }
+                        var isRemoteSyncing by remember { mutableStateOf(false) }
+                        var showScriptSetup by remember { mutableStateOf(false) }
+
+                        val formattedRemoteLastSync = remember(remoteLastSync) {
+                            if (remoteLastSync == 0L) {
+                                "Never"
+                            } else {
+                                try {
+                                    val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+                                    sdf.format(java.util.Date(remoteLastSync))
+                                } catch (e: Exception) {
+                                    "Unknown"
+                                }
+                            }
+                        }
+
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Keep your prompts synchronized and group-managed. Connect a Google Sheet URL for direct bidirectional synchronization.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            // Setup Details Row Card / Box
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                    .padding(8.dp)
+                            ) {
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text("💡 Web App 2-Way Synchronization:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                    Text("• Simple spreadsheet URLs are Read-Only.", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("• Paste your Google Apps Script URL below to unlock seamless real-time Read, Write, and Delete sync!", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+
+                            OutlinedButton(
+                                onClick = { showScriptSetup = !showScriptSetup },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(if (showScriptSetup) "Hide Apps Script Setup Guide" else "Show Apps Script 2-Way Guide", fontSize = 11.sp)
+                            }
+
+                            if (showScriptSetup) {
+                                val scriptCode = """
+                                function doGet(e) {
+                                  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+                                  var data = sheet.getDataRange().getValues();
+                                  var result = [];
+                                  for (var i = 1; i < data.length; i++) {
+                                    var row = data[i];
+                                    if (row[0] && row[2]) {
+                                      result.push({
+                                        category: row[0].toString(),
+                                        title: row[1] ? row[1].toString() : "",
+                                        content: row[2].toString(),
+                                        isAi: (row[3] ? row[3].toString().toLowerCase() : "").indexOf("ai") !== -1
+                                      });
+                                    }
+                                  }
+                                  return ContentService.createTextOutput(JSON.stringify(result))
+                                    .setMimeType(ContentService.MimeType.JSON);
+                                }
+
+                                function doPost(e) {
+                                  var params = JSON.parse(e.postData.contents);
+                                  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+                                  sheet.clear();
+                                  sheet.appendRow(["Category", "Title", "Content", "Type"]);
+                                  for (var i = 0; i < params.length; i++) {
+                                    var item = params[i];
+                                    sheet.appendRow([item.category, item.title, item.content, item.isAi ? "ai" : "template"]);
+                                  }
+                                  return ContentService.createTextOutput(JSON.stringify({status: "success"}))
+                                    .setMimeType(ContentService.MimeType.JSON);
+                                }
+                                """.trimIndent()
+
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                                        .padding(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text("How to Install Web App:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                    Text("1. Open your Google Sheet, click Extensions → Apps Script", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("2. Replace default code with script below & save", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("3. Click Deploy → New Deployment, select Web App", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("4. Execute as: 'Me', Who has access: 'Anyone'", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("5. Deploy, authorize access, copy Web App URL & paste below!", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(100.dp)
+                                            .background(MaterialTheme.colorScheme.background, RoundedCornerShape(4.dp))
+                                            .padding(6.dp)
+                                            .verticalScroll(rememberScrollState())
+                                    ) {
+                                        Text(
+                                            text = scriptCode,
+                                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                            fontSize = 9.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                            val clip = android.content.ClipData.newPlainText("Replai Apps Script", scriptCode)
+                                            clipboard.setPrimaryClip(clip)
+                                            Toast.makeText(context, "Apps Script copied! 📋", Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier.align(Alignment.End)
+                                    ) {
+                                        Text("Copy Script Code", fontSize = 10.sp)
+                                    }
+                                }
+                            }
+
+                            OutlinedTextField(
+                                value = sheetUrlInput,
+                                onValueChange = { sheetUrlInput = it },
+                                label = { Text("Google Sheet or Apps Script Web App URL", fontSize = 11.sp) },
+                                placeholder = { Text("https://script.google.com/macros/s/... or Google Sheets URL", fontSize = 10.sp) },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = false,
+                                maxLines = 3,
+                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp)
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = appendDataInput,
+                                    onCheckedChange = { appendDataInput = it }
+                                )
+                                Text(
+                                    text = "Consolidate previous local data into sheet",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                    .padding(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text("Remote Link Status:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(remoteStatus, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                Text("Last Synchronization: $formattedRemoteLastSync", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        viewModel.setRemoteUrlSyncSettings(sheetUrlInput, appendDataInput)
+                                        isRemoteSyncing = true
+                                        scope.launch {
+                                            viewModel.performBidirectionalSync(sheetUrlInput) { _, _ ->
+                                                isRemoteSyncing = false
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1.5f),
+                                    enabled = !isRemoteSyncing && sheetUrlInput.isNotBlank()
+                                ) {
+                                    if (isRemoteSyncing) {
+                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                                    } else {
+                                        Icon(Icons.Default.Refresh, contentDescription = "Sync", modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Connect & Sync Now", fontSize = 11.sp)
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        // Demo Sheet Link
+                                        sheetUrlInput = "https://docs.google.com/spreadsheets/d/1XlU-uR9i8tO4SclW_t7Yv9N8F78xQ56rS8J0pIDY4u8/edit?usp=sharing"
+                                        Toast.makeText(context, "Pasted standard demonstration template sheet!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("Load Sample", fontSize = 11.sp)
+                                }
+                            }
+
+                            if (remoteUrl.isNotBlank()) {
+                                OutlinedButton(
+                                    onClick = {
+                                        viewModel.setRemoteUrlSyncSettings("", false)
+                                        Toast.makeText(context, "Disconnected safely. All data remains in the app! 🔓", Toast.LENGTH_SHORT).show()
+                                    },
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Disconnect", modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Disconnect sheet but keep data", fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+
+                    1 -> {
+                        // Manual Copy-Paste Backup Tab
+                        var jsonPasteInput by remember { mutableStateOf("") }
+
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Export or restore your data offline without internet access. Copy the backup block as a safe text code and paste it to reload your templates on other platforms or devices.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        scope.launch {
+                                            val json = viewModel.exportToJson()
+                                            if (json.isNotBlank()) {
+                                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                                val clipData = android.content.ClipData.newPlainText("Replai Backup Data", json)
+                                                clipboardManager.setPrimaryClip(clipData)
+                                                Toast.makeText(context, "Full Backup copied to your Clipboard! 📋", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                Toast.makeText(context, "Export error: empty data", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.Share, contentDescription = "Export raw data", modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Copy Active Backup to Clipboard", fontSize = 11.sp)
+                                }
+                            }
+
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                            Text(
+                                text = "Paste Backup Payload to Restore:",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+
+                            OutlinedTextField(
+                                value = jsonPasteInput,
+                                onValueChange = { jsonPasteInput = it },
+                                placeholder = { Text("Paste your copied JSON code block here...", fontSize = 11.sp) },
+                                modifier = Modifier.fillMaxWidth().height(100.dp),
+                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 10.sp, fontFamily = FontFamily.Monospace),
+                                maxLines = 6,
+                                singleLine = false
+                            )
+
+                            Button(
+                                onClick = {
+                                    if (jsonPasteInput.isBlank()) {
+                                        Toast.makeText(context, "Please paste a backup JSON text block code first.", Toast.LENGTH_SHORT).show()
+                                        return@Button
+                                    }
+                                    scope.launch {
+                                        val success = viewModel.importFromJson(jsonPasteInput.trim())
+                                        if (success) {
+                                            Toast.makeText(context, "Backup successfully restored! 📱", Toast.LENGTH_SHORT).show()
+                                            jsonPasteInput = ""
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = jsonPasteInput.isNotBlank()
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = "Verify Restore", modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Verify & Overwrite Local Data", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close", fontWeight = FontWeight.Bold)
+            }
+        }
+    )
 }
 
 /**
@@ -2913,5 +3338,134 @@ fun CategoryReorderDialog(
                 }
             }
         }
+    }
+}
+
+object GDriveIcons {
+    val Cloud: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "Cloud",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).path(
+            fill = SolidColor(Color.White),
+            strokeLineWidth = 0f
+        ) {
+            moveTo(19.35f, 10.04f)
+            curveTo(18.67f, 6.59f, 15.64f, 4f, 12f, 4f)
+            curveTo(9.11f, 4f, 6.6f, 5.64f, 5.35f, 8.04f)
+            curveTo(2.34f, 8.36f, 0f, 10.91f, 0f, 14f)
+            curveTo(0f, 17.31f, 2.69f, 20f, 6f, 20f)
+            horizontalLineTo(19f)
+            curveTo(21.76f, 20f, 24f, 17.76f, 24f, 15f)
+            curveTo(24f, 12.36f, 21.95f, 10.22f, 19.35f, 10.04f)
+            close()
+        }.build()
+    }
+
+    val CloudQueue: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "CloudQueue",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).path(
+            fill = SolidColor(Color.White),
+            strokeLineWidth = 0f
+        ) {
+            moveTo(19.35f, 10.04f)
+            curveTo(18.67f, 6.59f, 15.64f, 4f, 12f, 4f)
+            curveTo(9.11f, 4f, 6.6f, 5.64f, 5.35f, 8.04f)
+            curveTo(2.34f, 8.36f, 0f, 10.91f, 0f, 14f)
+            curveTo(0f, 17.31f, 2.69f, 20f, 6f, 20f)
+            horizontalLineTo(19f)
+            curveTo(21.76f, 20f, 24f, 17.76f, 24f, 15f)
+            curveTo(24f, 12.36f, 21.95f, 10.22f, 19.35f, 10.04f)
+            close()
+            moveTo(19f, 18f)
+            horizontalLineTo(6f)
+            curveTo(3.79f, 18f, 2f, 16.21f, 2f, 14f)
+            curveTo(2f, 11.95f, 3.53f, 10.24f, 5.56f, 10.03f)
+            lineTo(6.63f, 9.92f)
+            lineTo(7.13f, 8.97f)
+            curveTo(8.08f, 7.14f, 9.94f, 6f, 12f, 6f)
+            curveTo(14.85f, 6f, 17.27f, 7.86f, 17.82f, 10.51f)
+            lineTo(18.09f, 11.79f)
+            lineTo(19.38f, 11.88f)
+            curveTo(20.89f, 11.99f, 22f, 13.34f, 22f, 15f)
+            curveTo(22f, 16.65f, 20.65f, 18f, 19f, 18f)
+            close()
+        }.build()
+    }
+
+    val CloudDone: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "CloudDone",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).path(
+            fill = SolidColor(Color.White),
+            strokeLineWidth = 0f
+        ) {
+            moveTo(19.35f, 10.04f)
+            curveTo(18.67f, 6.59f, 15.64f, 4f, 12f, 4f)
+            curveTo(9.11f, 4f, 6.6f, 5.64f, 5.35f, 8.04f)
+            curveTo(2.34f, 8.36f, 0f, 10.91f, 0f, 14f)
+            curveTo(0f, 17.31f, 2.69f, 20f, 6f, 20f)
+            horizontalLineTo(19f)
+            curveTo(21.76f, 20f, 24f, 17.76f, 24f, 15f)
+            curveTo(24f, 12.36f, 21.95f, 10.22f, 19.35f, 10.04f)
+            close()
+            moveTo(10f, 17f)
+            lineTo(6f, 13f)
+            lineTo(7.41f, 11.59f)
+            lineTo(10f, 14.17f)
+            lineTo(16.59f, 7.58f)
+            lineTo(18f, 9f)
+            lineTo(10f, 17f)
+            close()
+        }.build()
+    }
+
+    val Logout: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "Logout",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).path(
+            fill = SolidColor(Color.White),
+            strokeLineWidth = 0f
+        ) {
+            moveTo(17f, 7f)
+            lineTo(15.59f, 8.41f)
+            lineTo(18.17f, 11f)
+            horizontalLineTo(9f)
+            verticalLineTo(13f)
+            horizontalLineTo(18.17f)
+            lineTo(15.59f, 15.58f)
+            lineTo(17f, 17f)
+            lineTo(22f, 12f)
+            lineTo(17f, 7f)
+            close()
+            moveTo(4f, 5f)
+            horizontalLineTo(12f)
+            verticalLineTo(3f)
+            horizontalLineTo(4f)
+            curveTo(2.9f, 3f, 2f, 3.9f, 2f, 5f)
+            verticalLineTo(19f)
+            curveTo(2f, 20.1f, 2.9f, 21f, 4f, 21f)
+            horizontalLineTo(12f)
+            verticalLineTo(19f)
+            horizontalLineTo(4f)
+            verticalLineTo(5f)
+            close()
+        }.build()
     }
 }
