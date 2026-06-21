@@ -1,0 +1,6 @@
+{
+  "name": "Replai",
+  "description": "Replai – Quick Reply & Saved Messages: Your most-used messages — one tap away, in any app.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
