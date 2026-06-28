@@ -72,7 +72,7 @@ import androidx.compose.ui.graphics.vector.path
 
 class MainActivity : ComponentActivity() {
     companion object {
-        var initialSharedText: String? = null
+        val initialSharedText = androidx.compose.runtime.mutableStateOf<String?>(null)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,7 +83,7 @@ class MainActivity : ComponentActivity() {
             Log.e("MainActivity", "MobileAds init error", e)
         }
         if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
-            initialSharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+            initialSharedText.value = intent.getStringExtra(Intent.EXTRA_TEXT)
         }
         enableEdgeToEdge()
         setContent {
@@ -97,6 +97,13 @@ class MainActivity : ComponentActivity() {
             MyApplicationTheme(darkTheme = isDark) {
                 ReplaiApp(viewModel)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == Intent.ACTION_SEND && intent.type == "text/plain") {
+            initialSharedText.value = intent.getStringExtra(Intent.EXTRA_TEXT)
         }
     }
 }
@@ -274,11 +281,12 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
     var showAddReplyDialog by remember { mutableStateOf(false) }
     var initialContentText by remember { mutableStateOf("") }
 
-    LaunchedEffect(Unit) {
-        MainActivity.initialSharedText?.let { sharedText ->
+    val sharedText = MainActivity.initialSharedText.value
+    LaunchedEffect(sharedText) {
+        if (sharedText != null) {
             initialContentText = sharedText
             showAddReplyDialog = true
-            MainActivity.initialSharedText = null
+            MainActivity.initialSharedText.value = null
         }
     }
 
@@ -662,6 +670,7 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 isAiPromptDefault = if (replyToEdit != null) replyToEdit!!.isAiPrompt else isAddingAiPrompt,
                 defaultCategoryId = activeCategoryFilter?.id,
                 initialContent = initialContentText,
+                checkForDuplicate = { t, c -> viewModel.checkForDuplicate(t, c) },
                 onDismiss = {
                     showAddReplyDialog = false
                     replyToEdit = null
@@ -2114,7 +2123,7 @@ fun SettingsBackupTabContent(
                             Text("Grant Overlay Permission 🔓", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         }
                     } else {
-                        var isBubbleEnabled by remember { mutableStateOf(FloatingBubbleService.isRunning) }
+                        val isBubbleEnabled = FloatingBubbleService.isRunningState.value
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -2128,7 +2137,6 @@ fun SettingsBackupTabContent(
                             Switch(
                                 checked = isBubbleEnabled,
                                 onCheckedChange = { checked ->
-                                    isBubbleEnabled = checked
                                     val intent = Intent(context, FloatingBubbleService::class.java)
                                     if (checked) {
                                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -2888,10 +2896,12 @@ fun AddEditReplyDialog(
     isAiPromptDefault: Boolean = false,
     defaultCategoryId: Long? = null,
     initialContent: String = "",
+    checkForDuplicate: ((title: String, content: String) -> Boolean)? = null,
     onDismiss: () -> Unit,
     onSave: (categoryId: Long, title: String, content: String, isAiPrompt: Boolean) -> Unit,
     onDelete: (Reply) -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var title by remember { mutableStateOf(reply?.title ?: "") }
     var content by remember { mutableStateOf(reply?.content ?: (if (initialContent.isNotEmpty()) initialContent else "")) }
     val isAiPrompt = remember { reply?.isAiPrompt ?: isAiPromptDefault }
@@ -3062,7 +3072,17 @@ fun AddEditReplyDialog(
                         onClick = {
                             val catId = selectedCategory?.id ?: categories.firstOrNull()?.id ?: 1L
                             if (title.isNotBlank() && content.isNotBlank()) {
-                                onSave(catId, title, content, isAiPrompt)
+                                val isDup = if (reply == null) {
+                                    checkForDuplicate?.invoke(title, content) == true
+                                } else {
+                                    (reply.title != title || reply.content != content) && checkForDuplicate?.invoke(title, content) == true
+                                }
+
+                                if (isDup) {
+                                    android.widget.Toast.makeText(context, "A template with this title and content already exists!", android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    onSave(catId, title, content, isAiPrompt)
+                                }
                             }
                         },
                         enabled = title.isNotBlank() && content.isNotBlank(),

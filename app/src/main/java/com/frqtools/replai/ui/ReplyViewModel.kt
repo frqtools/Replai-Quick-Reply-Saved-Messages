@@ -333,6 +333,28 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 mergeRows(localRows, remoteRows)
             }
 
+            // Create snapshots of existing categories' colors and icons
+            val categoryColorMap = localCategories.associate { 
+                it.name.lowercase().trim() to it.colorHex 
+            }
+            val categoryIconMap = localCategories.associate { 
+                it.name.lowercase().trim() to it.iconName 
+            }
+
+            // Create snapshots of existing replies' pins, lastUsedAt, and usageCount
+            // We uniquely identify a reply by the combination of category_name, title, and content
+            val replyPinMap = mutableMapOf<String, Boolean>()
+            val replyLastUsedMap = mutableMapOf<String, Long>()
+            val replyUsageCountMap = mutableMapOf<String, Int>()
+
+            localReplies.forEach { reply ->
+                val categoryName = localCategories.find { it.id == reply.categoryId }?.name ?: ""
+                val uniqueKey = "${categoryName.lowercase().trim()}|${reply.title.lowercase().trim()}|${reply.content.lowercase().trim()}"
+                replyPinMap[uniqueKey] = reply.isPinned
+                replyLastUsedMap[uniqueKey] = reply.lastUsedAt
+                replyUsageCountMap[uniqueKey] = reply.usageCount
+            }
+
             // 4. Update the local Room database to match
             database.replyDao().deleteAllReplies()
             database.categoryDao().deleteAllCategories()
@@ -340,24 +362,37 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
             val createdCategories = mutableMapOf<String, Long>()
             var orderIdx = 0
             for (row in mergedRows) {
-                var categoryId = createdCategories[row.category.lowercase().trim()]
+                val catKey = row.category.lowercase().trim()
+                var categoryId = createdCategories[catKey]
                 if (categoryId == null) {
+                    val existingColor = categoryColorMap[catKey] ?: "#6200EE"
+                    val existingIcon = categoryIconMap[catKey] ?: (if (row.isAi) "psychology" else "folder")
                     categoryId = database.categoryDao().insertCategory(
                         Category(
                             name = row.category.trim(),
-                            iconName = if (row.isAi) "psychology" else "folder",
+                            iconName = existingIcon,
                             orderIndex = orderIdx++,
-                            isForAi = row.isAi
+                            isForAi = row.isAi,
+                            colorHex = existingColor
                         )
                     )
-                    createdCategories[row.category.lowercase().trim()] = categoryId
+                    createdCategories[catKey] = categoryId
                 }
+                
+                val replyKey = "${row.category.lowercase().trim()}|${row.title.lowercase().trim()}|${row.content.lowercase().trim()}"
+                val isPinned = replyPinMap[replyKey] ?: false
+                val lastUsedAt = replyLastUsedMap[replyKey] ?: 0L
+                val usageCount = replyUsageCountMap[replyKey] ?: 0
+
                 database.replyDao().insertReply(
                     Reply(
                         categoryId = categoryId,
                         title = row.title.trim(),
                         content = row.content.trim(),
-                        isAiPrompt = row.isAi
+                        isAiPrompt = row.isAi,
+                        isPinned = isPinned,
+                        lastUsedAt = lastUsedAt,
+                        usageCount = usageCount
                     )
                 )
             }
@@ -812,6 +847,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 categoryObj.put("name", category.name)
                 categoryObj.put("iconName", category.iconName)
                 categoryObj.put("orderIndex", category.orderIndex)
+                categoryObj.put("colorHex", category.colorHex)
 
                 val repliesArray = JSONArray()
                 val matchedReplies = repliesList.filter { it.categoryId == category.id }
@@ -821,6 +857,8 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     replyObj.put("content", reply.content)
                     replyObj.put("usageCount", reply.usageCount)
                     replyObj.put("isAiPrompt", reply.isAiPrompt)
+                    replyObj.put("isPinned", reply.isPinned)
+                    replyObj.put("lastUsedAt", reply.lastUsedAt)
                     repliesArray.put(replyObj)
                 }
 
@@ -852,6 +890,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 val catIcon = catObj.optString("iconName", "folder")
                 val catOrder = catObj.optInt("orderIndex", 0)
                 val catIsForAi = catObj.optBoolean("isForAi", false)
+                val catColorHex = catObj.optString("colorHex", "#6200EE")
 
                 // Check if category already matches name
                 var category = database.categoryDao().getCategoryByName(catName)
@@ -859,7 +898,13 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     category.id
                 } else {
                     database.categoryDao().insertCategory(
-                        Category(name = catName, iconName = catIcon, orderIndex = catOrder, isForAi = catIsForAi)
+                        Category(
+                            name = catName,
+                            iconName = catIcon,
+                            orderIndex = catOrder,
+                            isForAi = catIsForAi,
+                            colorHex = catColorHex
+                        )
                     )
                 }
 
@@ -870,6 +915,8 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     val rContent = replyObj.getString("content")
                     val rCount = replyObj.optInt("usageCount", 0)
                     val rIsAi = replyObj.optBoolean("isAiPrompt", false)
+                    val rIsPinned = replyObj.optBoolean("isPinned", false)
+                    val rLastUsedAt = replyObj.optLong("lastUsedAt", 0L)
 
                     // Simply insert all replies (can have duplicates or duplicates checked as needed)
                     database.replyDao().insertReply(
@@ -878,7 +925,9 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                             title = rTitle,
                             content = rContent,
                             usageCount = rCount,
-                            isAiPrompt = rIsAi
+                            isAiPrompt = rIsAi,
+                            isPinned = rIsPinned,
+                            lastUsedAt = rLastUsedAt
                         )
                     )
                 }

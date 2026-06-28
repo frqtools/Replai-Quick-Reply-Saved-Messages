@@ -63,7 +63,7 @@ import com.frqtools.replai.data.AppDatabase
 import com.frqtools.replai.data.Category
 import com.frqtools.replai.data.Reply
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collect
 
 class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
 
@@ -94,7 +94,12 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
         private const val CHANNEL_ID = "FloatingBubbleChannel"
         private const val NOTIFICATION_ID = 5001
         const val ACTION_STOP = "STOP_BUBBLE_SERVICE"
-        var isRunning = false
+        val isRunningState = androidx.compose.runtime.mutableStateOf(false)
+        var isRunning: Boolean
+            get() = isRunningState.value
+            set(value) {
+                isRunningState.value = value
+            }
     }
 
     override fun onCreate() {
@@ -113,18 +118,28 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
     }
 
     private fun loadDatabaseData() {
-        scope.launch(Dispatchers.IO) {
+        scope.launch {
             val db = AppDatabase.getDatabase(applicationContext)
-            val cats = db.categoryDao().getAllCategories().first()
-            val reps = db.replyDao().getAllReplies().first()
-            withContext(Dispatchers.Main) {
-                categories.clear()
-                categories.addAll(cats)
-                if (cats.isNotEmpty()) {
-                    selectedCategoryId.value = cats.first().id
+            
+            // Collect categories reactively
+            launch {
+                db.categoryDao().getAllCategories().collect { cats ->
+                    categories.clear()
+                    categories.addAll(cats)
+                    if (selectedCategoryId.value == null && cats.isNotEmpty()) {
+                        selectedCategoryId.value = cats.first().id
+                    } else if (cats.isNotEmpty() && cats.none { it.id == selectedCategoryId.value }) {
+                        selectedCategoryId.value = cats.first().id
+                    }
                 }
-                replies.clear()
-                replies.addAll(reps)
+            }
+
+            // Collect replies reactively
+            launch {
+                db.replyDao().getAllReplies().collect { reps ->
+                    replies.clear()
+                    replies.addAll(reps)
+                }
             }
         }
     }
@@ -203,124 +218,143 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
             setViewTreeSavedStateRegistryOwner(this@FloatingBubbleService)
 
             setContent {
-                Surface(
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth(0.9f)
-                        .height(380.dp)
-                        .clip(RoundedCornerShape(16.dp)),
-                    color = MaterialTheme.colorScheme.surface,
-                    tonalElevation = 8.dp,
-                    shadowElevation = 8.dp
+                        .fillMaxSize()
+                        .clickable(
+                            interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            hideOverlay()
+                        },
+                    contentAlignment = Alignment.Center
                 ) {
-                    Column(
+                    Surface(
                         modifier = Modifier
-                            .fillMaxSize()
-                            .padding(12.dp)
+                            .fillMaxWidth(0.9f)
+                            .height(380.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .clickable(
+                                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                                indication = null
+                            ) {
+                                // Intercept clicks inside the surface so they do not close the overlay
+                            },
+                        color = MaterialTheme.colorScheme.surface,
+                        tonalElevation = 8.dp,
+                        shadowElevation = 8.dp
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Replai Quick Access",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 16.sp,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            IconButton(onClick = { hideOverlay() }) {
-                                Icon(Icons.Default.Close, contentDescription = "Close")
-                            }
-                        }
-
-                        // Categories List
-                        LazyRow(
+                        Column(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                .fillMaxSize()
+                                .padding(12.dp)
                         ) {
-                            items(categories) { category ->
-                                val isSelected = selectedCategoryId.value == category.id
-                                val color = try {
-                                    Color(android.graphics.Color.parseColor(category.colorHex))
-                                } catch (e: Exception) {
-                                    MaterialTheme.colorScheme.primary
-                                }
-                                AssistChip(
-                                    onClick = { selectedCategoryId.value = category.id },
-                                    label = { Text(category.name, fontSize = 12.sp) },
-                                    colors = AssistChipDefaults.assistChipColors(
-                                        containerColor = if (isSelected) color.copy(alpha = 0.15f) else Color.Transparent,
-                                        labelColor = if (isSelected) color else MaterialTheme.colorScheme.onSurface
-                                    )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Replai Quick Access",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 16.sp,
+                                    color = MaterialTheme.colorScheme.primary
                                 )
+                                IconButton(onClick = { hideOverlay() }) {
+                                    Icon(Icons.Default.Close, contentDescription = "Close")
+                                }
                             }
-                        }
 
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        // Replies filtered by selected category
-                        val filteredList = replies.filter { it.categoryId == selectedCategoryId.value }
-
-                        if (filteredList.isEmpty()) {
-                            Box(
+                            // Categories List
+                            LazyRow(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .weight(1.0f),
-                                contentAlignment = Alignment.Center
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Text("No templates in this category.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                        } else {
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1.0f),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                items(filteredList) { reply ->
-                                    Card(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                copyToClipboardAndClose(reply)
-                                            },
-                                        colors = CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                items(categories) { category ->
+                                    val isSelected = selectedCategoryId.value == category.id
+                                    val color = try {
+                                        Color(android.graphics.Color.parseColor(category.colorHex))
+                                    } catch (e: Exception) {
+                                        MaterialTheme.colorScheme.primary
+                                    }
+                                    val labelColor = if (isSelected) color else MaterialTheme.colorScheme.onSurface
+                                    AssistChip(
+                                        onClick = { selectedCategoryId.value = category.id },
+                                        label = { Text(category.name, fontSize = 12.sp) },
+                                        colors = AssistChipDefaults.assistChipColors(
+                                            containerColor = if (isSelected) color.copy(alpha = 0.15f) else Color.Transparent,
+                                            labelColor = labelColor
                                         )
-                                    ) {
-                                        Column(modifier = Modifier.padding(10.dp)) {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text(
-                                                    text = reply.title,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    fontSize = 13.sp,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    color = MaterialTheme.colorScheme.onSurface
-                                                )
-                                                if (reply.isPinned) {
-                                                    Icon(
-                                                        Icons.Default.Star,
-                                                        contentDescription = "Pinned",
-                                                        tint = MaterialTheme.colorScheme.primary,
-                                                        modifier = Modifier.size(14.dp)
-                                                    )
-                                                }
-                                            }
-                                            Spacer(modifier = Modifier.height(2.dp))
-                                            Text(
-                                                text = reply.content,
-                                                fontSize = 11.sp,
-                                                maxLines = 2,
-                                                overflow = TextOverflow.Ellipsis,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            // Replies filtered by selected category
+                            val filteredList = replies.filter { it.categoryId == selectedCategoryId.value }
+
+                            if (filteredList.isEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(1.0f),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("No templates in this category.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            } else {
+                                LazyColumn(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(1.0f),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    items(filteredList) { reply ->
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    copyToClipboardAndClose(reply)
+                                                },
+                                            colors = CardDefaults.cardColors(
+                                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
                                             )
+                                        ) {
+                                            Column(modifier = Modifier.padding(10.dp)) {
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Text(
+                                                        text = reply.title,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        fontSize = 13.sp,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                        color = MaterialTheme.colorScheme.onSurface
+                                                    )
+                                                    if (reply.isPinned) {
+                                                        Icon(
+                                                            Icons.Default.Star,
+                                                            contentDescription = "Pinned",
+                                                            tint = MaterialTheme.colorScheme.primary,
+                                                            modifier = Modifier.size(14.dp)
+                                                        )
+                                                    }
+                                                }
+                                                Spacer(modifier = Modifier.height(2.dp))
+                                                Text(
+                                                    text = reply.content,
+                                                    fontSize = 11.sp,
+                                                    maxLines = 2,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -333,7 +367,7 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
 
         overlayParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             } else {
