@@ -11,7 +11,8 @@ data class Category(
     val name: String,
     val iconName: String = "folder",
     val orderIndex: Int = 0,
-    val isForAi: Boolean = false
+    val isForAi: Boolean = false,
+    val colorHex: String = "#6200EE"
 )
 
 @Entity(
@@ -33,5 +34,7 @@ data class Reply(
     val content: String,
     val usageCount: Int = 0,
     val isAiPrompt: Boolean = false,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val isPinned: Boolean = false,
+    val lastUsedAt: Long = 0L
 )

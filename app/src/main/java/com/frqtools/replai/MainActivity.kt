@@ -62,13 +62,29 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import android.net.Uri
 import androidx.compose.foundation.gestures.detectDragGestures
+import android.os.Build
+import android.provider.Settings as AndroidSettings
+import com.google.android.gms.ads.MobileAds
+import com.frqtools.replai.service.FloatingBubbleService
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.path
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        var initialSharedText: String? = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            MobileAds.initialize(this) {}
+        } catch (e: Exception) {
+            Log.e("MainActivity", "MobileAds init error", e)
+        }
+        if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
+            initialSharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+        }
         enableEdgeToEdge()
         setContent {
             val viewModel: ReplyViewModel = viewModel()
@@ -105,22 +121,28 @@ fun ReplaiApp(viewModel: ReplyViewModel = viewModel()) {
 
     // Splash Timer
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.delay(400)
+        kotlinx.coroutines.delay(500)
         showSplash = false
     }
+
+    val onboardingCompleted by viewModel.onboardingCompleted.collectAsState()
 
     Box(
         modifier = Modifier.fillMaxSize()
     ) {
         Crossfade(
             targetState = showSplash,
-            animationSpec = tween(600),
+            animationSpec = tween(300),
             label = "SplashToMain"
         ) { isSplash ->
             if (isSplash) {
                 SplashScreen()
             } else {
-                MainAppLayout(viewModel = viewModel)
+                if (!onboardingCompleted) {
+                    OnboardingScreen(onComplete = { viewModel.completeOnboarding() })
+                } else {
+                    MainAppLayout(viewModel = viewModel)
+                }
             }
         }
     }
@@ -250,6 +272,16 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
 
     // Dialog state controllers
     var showAddReplyDialog by remember { mutableStateOf(false) }
+    var initialContentText by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        MainActivity.initialSharedText?.let { sharedText ->
+            initialContentText = sharedText
+            showAddReplyDialog = true
+            MainActivity.initialSharedText = null
+        }
+    }
+
     var replyToEdit by remember { mutableStateOf<Reply?>(null) }
     var categoryToEdit by remember { mutableStateOf<Category?>(null) }
     var categoryToDelete by remember { mutableStateOf<Category?>(null) }
@@ -273,6 +305,7 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
     // Variable interpolation prompt controller
     var activeVariableReply by remember { mutableStateOf<Reply?>(null) }
 
+    val hapticFeedback = androidx.compose.ui.platform.LocalHapticFeedback.current
     val systemClipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
     /**
@@ -284,6 +317,11 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
             activeVariableReply = reply
         } else {
             // Direct copy
+            try {
+                hapticFeedback.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Haptic error", e)
+            }
             val clip = ClipData.newPlainText("Replai Clipboard", reply.content)
             systemClipboard.setPrimaryClip(clip)
             viewModel.incrementUsage(reply.id)
@@ -293,48 +331,52 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
 
     Scaffold(
         bottomBar = {
-            NavigationBar(
-                containerColor = MaterialTheme.colorScheme.surface,
-                modifier = Modifier.fillMaxWidth().testTag("tabs_row")
-            ) {
-                NavigationBarItem(
-                    selected = activeTab == 0,
-                    onClick = {
-                        if (activeTab == 0) {
-                            scope.launch { repliesListState.animateScrollToItem(0) }
-                        } else {
-                            activeTab = 0
+            val isProMode by viewModel.isProMode.collectAsState()
+            Column(modifier = Modifier.fillMaxWidth()) {
+                AdmobBanner(isProMode)
+                NavigationBar(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    modifier = Modifier.fillMaxWidth().testTag("tabs_row")
+                ) {
+                    NavigationBarItem(
+                        selected = activeTab == 0,
+                        onClick = {
+                            if (activeTab == 0) {
+                                scope.launch { repliesListState.animateScrollToItem(0) }
+                            } else {
+                                activeTab = 0
+                                isMultiSelectMode = false
+                                selectedReplyIds.clear()
+                            }
+                        },
+                        icon = { Icon(Icons.Default.Email, contentDescription = "Replies Tab") },
+                        label = { Text("Replies", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                    )
+                    NavigationBarItem(
+                        selected = activeTab == 1,
+                        onClick = {
+                            if (activeTab == 1) {
+                                scope.launch { aiPromptsListState.animateScrollToItem(0) }
+                            } else {
+                                activeTab = 1
+                                isMultiSelectMode = false
+                                selectedReplyIds.clear()
+                            }
+                        },
+                        icon = { Icon(Icons.Default.Star, contentDescription = "AI Prompts Tab") },
+                        label = { Text("AI Prompts", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                    )
+                    NavigationBarItem(
+                        selected = activeTab == 2,
+                        onClick = {
+                            activeTab = 2
                             isMultiSelectMode = false
                             selectedReplyIds.clear()
-                        }
-                    },
-                    icon = { Icon(Icons.Default.Email, contentDescription = "Replies Tab") },
-                    label = { Text("Replies", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
-                )
-                NavigationBarItem(
-                    selected = activeTab == 1,
-                    onClick = {
-                        if (activeTab == 1) {
-                            scope.launch { aiPromptsListState.animateScrollToItem(0) }
-                        } else {
-                            activeTab = 1
-                            isMultiSelectMode = false
-                            selectedReplyIds.clear()
-                        }
-                    },
-                    icon = { Icon(Icons.Default.Star, contentDescription = "AI Prompts Tab") },
-                    label = { Text("AI Prompts", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
-                )
-                NavigationBarItem(
-                    selected = activeTab == 2,
-                    onClick = {
-                        activeTab = 2
-                        isMultiSelectMode = false
-                        selectedReplyIds.clear()
-                    },
-                    icon = { Icon(Icons.Default.Settings, contentDescription = "Settings Tab") },
-                    label = { Text("Settings", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
-                )
+                        },
+                        icon = { Icon(Icons.Default.Settings, contentDescription = "Settings Tab") },
+                        label = { Text("Settings", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                    )
+                }
             }
         },
         floatingActionButton = {
@@ -525,7 +567,8 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                             },
                             onItemEditClick = { reply ->
                                 replyToEdit = reply
-                            }
+                            },
+                            onPinToggle = { viewModel.togglePinReply(it) }
                         )
                     }
                     1 -> {
@@ -571,7 +614,8 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                             onAddPromptClick = {
                                 isAddingAiPrompt = true
                                 showAddReplyDialog = true
-                            }
+                            },
+                            onPinToggle = { viewModel.togglePinReply(it) }
                         )
                     }
                     2 -> {
@@ -596,6 +640,11 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 onDismiss = { activeVariableReply = null },
                 onCopied = { expandedText ->
                     // Set to clipboard
+                    try {
+                        hapticFeedback.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                    } catch (e: Exception) {
+                        Log.e("MainActivity", "Haptic error", e)
+                    }
                     val clip = ClipData.newPlainText("Replai Clipboard", expandedText)
                     systemClipboard.setPrimaryClip(clip)
                     viewModel.incrementUsage(reply.id)
@@ -612,9 +661,11 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 categories = categories,
                 isAiPromptDefault = if (replyToEdit != null) replyToEdit!!.isAiPrompt else isAddingAiPrompt,
                 defaultCategoryId = activeCategoryFilter?.id,
+                initialContent = initialContentText,
                 onDismiss = {
                     showAddReplyDialog = false
                     replyToEdit = null
+                    initialContentText = ""
                 },
                 onSave = { categoryId, title, content, isAiPrompt ->
                     if (replyToEdit != null) {
@@ -624,11 +675,13 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                     }
                     showAddReplyDialog = false
                     replyToEdit = null
+                    initialContentText = ""
                 },
                 onDelete = { reply ->
                     viewModel.deleteReply(reply)
                     showAddReplyDialog = false
                     replyToEdit = null
+                    initialContentText = ""
                 }
             )
         }
@@ -639,8 +692,8 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 category = null,
                 isAiPromptDefault = (activeTab == 1),
                 onDismiss = { showAddCategoryDialog = false },
-                onSave = { name, icon, isForAi ->
-                    viewModel.addCategory(name, icon, isForAi = isForAi)
+                onSave = { name, icon, isForAi, color ->
+                    viewModel.addCategory(name, icon, isForAi = isForAi, colorHex = color)
                     showAddCategoryDialog = false
                 },
                 onDelete = {}
@@ -653,8 +706,8 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 category = cat,
                 isAiPromptDefault = (activeTab == 1),
                 onDismiss = { categoryToEdit = null },
-                onSave = { name, icon, isForAi ->
-                    viewModel.updateCategory(cat, name, icon, isForAi)
+                onSave = { name, icon, isForAi, color ->
+                    viewModel.updateCategory(cat, name, icon, isForAi, color)
                     categoryToEdit = null
                 },
                 onDelete = {
@@ -1262,17 +1315,44 @@ fun CategoryFilterBar(
 
         // Listed categories
         items(categories) { category ->
+            val isSelected = activeCategoryFilter?.id == category.id
+            val catColor = try {
+                Color(android.graphics.Color.parseColor(category.colorHex))
+            } catch (e: Exception) {
+                MaterialTheme.colorScheme.primary
+            }
             FilterChip(
-                selected = activeCategoryFilter?.id == category.id,
+                selected = isSelected,
                 onClick = { onCategoryFilterSelect(category) },
-                label = { Text(category.name) },
+                label = {
+                    Text(
+                        text = category.name,
+                        color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface
+                    )
+                },
                 leadingIcon = {
                     Icon(
                         imageVector = getIconForName(category.iconName),
                         contentDescription = category.name,
+                        tint = if (isSelected) Color.White else catColor,
                         modifier = Modifier.size(16.dp)
                     )
                 },
+                colors = if (isSelected) {
+                    FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = catColor,
+                        selectedLabelColor = Color.White,
+                        selectedLeadingIconColor = Color.White
+                    )
+                } else {
+                    FilterChipDefaults.filterChipColors()
+                },
+                border = FilterChipDefaults.filterChipBorder(
+                    selected = isSelected,
+                    enabled = true,
+                    borderColor = catColor.copy(alpha = 0.4f),
+                    selectedBorderColor = catColor
+                ),
                 modifier = Modifier.combinedClickable(
                     onClick = { onCategoryFilterSelect(category) },
                     onLongClick = { onCategoryLongClick(category) }
@@ -1365,7 +1445,8 @@ fun RepliesTabContent(
     onEnterMultiSelect: (Long) -> Unit = {},
     onItemClick: (Reply) -> Unit,
     onItemLongClick: (Reply) -> Unit,
-    onItemEditClick: (Reply) -> Unit
+    onItemEditClick: (Reply) -> Unit,
+    onPinToggle: (Reply) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         if (replies.isEmpty()) {
@@ -1419,6 +1500,7 @@ fun RepliesTabContent(
                         category = category,
                         onClick = { onItemClick(reply) },
                         onLongClick = { onItemLongClick(reply) },
+                        onPinToggle = { onPinToggle(reply) },
                         isMultiSelectMode = isMultiSelectMode,
                         isSelected = reply.id in selectedReplyIds,
                         onEditClick = { onItemEditClick(reply) }
@@ -1476,6 +1558,7 @@ fun ReplyCardItem(
     category: Category?,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    onPinToggle: () -> Unit,
     isMultiSelectMode: Boolean = false,
     isSelected: Boolean = false,
     onEditClick: (() -> Unit)? = null,
@@ -1537,6 +1620,14 @@ fun ReplyCardItem(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
+                        if (reply.isPinned) {
+                            Icon(
+                                imageVector = Icons.Default.Star,
+                                contentDescription = "Pinned",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(12.dp)
+                            )
+                        }
                         if (reply.usageCount > 0) {
                             Surface(
                                 shape = CircleShape,
@@ -1586,6 +1677,20 @@ fun ReplyCardItem(
                                         color = MaterialTheme.colorScheme.tertiary
                                     )
                                 }
+                            }
+                        }
+
+                        if (!isMultiSelectMode) {
+                            IconButton(
+                                onClick = onPinToggle,
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Star,
+                                    contentDescription = "Toggle Pin",
+                                    tint = if (reply.isPinned) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
+                                    modifier = Modifier.size(14.dp)
+                                )
                             }
                         }
 
@@ -1656,21 +1761,31 @@ fun ReplyCardItem(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = if (hasVariables) "⚡ Tap to compile & hold to edit" else "⚡ Tap once to copy & hold to edit",
-                        fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                        fontWeight = FontWeight.Medium
-                    )
-
-                    if (hasVariables) {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Requires: ${variables.joinToString()}",
+                            text = if (hasVariables) "⚡ Tap to compile & hold to edit" else "⚡ Tap once to copy & hold to edit",
                             fontSize = 10.sp,
-                            color = MaterialTheme.colorScheme.secondary,
-                            fontWeight = FontWeight.SemiBold
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
+                            fontWeight = FontWeight.Medium
                         )
+                        if (hasVariables) {
+                            Text(
+                                text = "Requires: ${variables.joinToString()}",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.secondary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
+                    val charCount = reply.content.length
+                    val wordCount = reply.content.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
+                    Text(
+                        text = "${charCount} chars • ${wordCount} words",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.35f),
+                        maxLines = 1
+                    )
                 }
             }
         }
@@ -1692,7 +1807,8 @@ fun AiPromptsTabContent(
     onItemClick: (Reply) -> Unit,
     onItemLongClick: (Reply) -> Unit,
     onItemEditClick: (Reply) -> Unit,
-    onAddPromptClick: () -> Unit
+    onAddPromptClick: () -> Unit,
+    onPinToggle: (Reply) -> Unit
 ) {
     Column(
         modifier = Modifier.fillMaxSize()
@@ -1747,6 +1863,7 @@ fun AiPromptsTabContent(
                         category = category,
                         onClick = { onItemClick(reply) },
                         onLongClick = { onItemLongClick(reply) },
+                        onPinToggle = { onPinToggle(reply) },
                         isMultiSelectMode = isMultiSelectMode,
                         isSelected = reply.id in selectedReplyIds,
                         onEditClick = { onItemEditClick(reply) }
@@ -1952,6 +2069,112 @@ fun SettingsBackupTabContent(
                             }
                         }
                     }
+                }
+
+                Divider(modifier = Modifier.padding(vertical = 4.dp))
+
+                // Floating Overlay Configuration
+                Column {
+                    Text(
+                        text = "Quick-Access Overlay Bubble",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Draws a floating bubble over other apps to let you copy template replies quickly without changing apps.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                        lineHeight = 15.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        AndroidSettings.canDrawOverlays(context)
+                    } else {
+                        true
+                    }
+
+                    if (!hasPermission) {
+                        Button(
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                    val intent = Intent(
+                                        AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:${context.packageName}")
+                                    )
+                                    context.startActivity(intent)
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Grant Overlay Permission 🔓", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    } else {
+                        var isBubbleEnabled by remember { mutableStateOf(FloatingBubbleService.isRunning) }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (isBubbleEnabled) "Active Overlay Bubble 🟢" else "Overlay Bubble Disabled ⚪",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Switch(
+                                checked = isBubbleEnabled,
+                                onCheckedChange = { checked ->
+                                    isBubbleEnabled = checked
+                                    val intent = Intent(context, FloatingBubbleService::class.java)
+                                    if (checked) {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            context.startForegroundService(intent)
+                                        } else {
+                                            context.startService(intent)
+                                        }
+                                    } else {
+                                        context.stopService(intent)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Divider(modifier = Modifier.padding(vertical = 4.dp))
+
+                // Simulate Pro Mode
+                val isProMode by viewModel.isProMode.collectAsState()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Simulate Pro Mode 💎",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Toggle this off to view the test AdMob banner, or toggle on to simulate ad-free premium mode.",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                            lineHeight = 15.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Switch(
+                        checked = isProMode,
+                        onCheckedChange = { checked ->
+                            viewModel.setProMode(checked)
+                        }
+                    )
                 }
             }
         }
@@ -2664,12 +2887,13 @@ fun AddEditReplyDialog(
     categories: List<Category>,
     isAiPromptDefault: Boolean = false,
     defaultCategoryId: Long? = null,
+    initialContent: String = "",
     onDismiss: () -> Unit,
     onSave: (categoryId: Long, title: String, content: String, isAiPrompt: Boolean) -> Unit,
     onDelete: (Reply) -> Unit
 ) {
     var title by remember { mutableStateOf(reply?.title ?: "") }
-    var content by remember { mutableStateOf(reply?.content ?: "") }
+    var content by remember { mutableStateOf(reply?.content ?: (if (initialContent.isNotEmpty()) initialContent else "")) }
     val isAiPrompt = remember { reply?.isAiPrompt ?: isAiPromptDefault }
     var selectedCategory by remember {
         mutableStateOf(
@@ -2861,12 +3085,13 @@ fun AddEditCategoryDialog(
     category: Category?,
     isAiPromptDefault: Boolean = false,
     onDismiss: () -> Unit,
-    onSave: (name: String, icon: String, isForAi: Boolean) -> Unit,
+    onSave: (name: String, icon: String, isForAi: Boolean, colorHex: String) -> Unit,
     onDelete: () -> Unit
 ) {
     var name by remember { mutableStateOf(category?.name ?: "") }
     var selectedIcon by remember { mutableStateOf(category?.iconName ?: "folder") }
     var isForAi by remember { mutableStateOf(category?.isForAi ?: isAiPromptDefault) }
+    var selectedColorHex by remember { mutableStateOf(category?.colorHex ?: "#6200EE") }
 
     val iconChoices = listOf("folder", "star", "home", "email", "credit_card", "event", "map")
 
@@ -2980,6 +3205,62 @@ fun AddEditCategoryDialog(
                     }
                 }
 
+                Text(
+                    text = "Select Category Accent Color:",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+
+                val colorsPreset = listOf(
+                    "#6200EE", // Purple
+                    "#3700B3", // Indigo
+                    "#03DAC6", // Teal
+                    "#FF0266", // Pink
+                    "#FF9100", // Orange
+                    "#00E5FF", // Cyan
+                    "#00E676", // Green
+                    "#FF3D00"  // Red-Orange
+                )
+
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(colorsPreset) { colorString ->
+                        val isColorSelected = selectedColorHex == colorString
+                        val col = try {
+                            Color(android.graphics.Color.parseColor(colorString))
+                        } catch (e: Exception) {
+                            MaterialTheme.colorScheme.primary
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(col)
+                                .border(
+                                    BorderStroke(
+                                        width = if (isColorSelected) 3.dp else 0.dp,
+                                        color = if (isColorSelected) MaterialTheme.colorScheme.onSurface else Color.Transparent
+                                    ),
+                                    CircleShape
+                                )
+                                .clickable { selectedColorHex = colorString },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (isColorSelected) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Selected",
+                                    tint = if (colorString == "#03DAC6" || colorString == "#00E5FF" || colorString == "#00E676") Color.Black else Color.White,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Row(
@@ -2992,7 +3273,7 @@ fun AddEditCategoryDialog(
                     Button(
                         onClick = {
                             if (name.isNotBlank()) {
-                                onSave(name, selectedIcon, isForAi)
+                                onSave(name, selectedIcon, isForAi, selectedColorHex)
                             }
                         },
                         enabled = name.isNotBlank()
@@ -3468,4 +3749,132 @@ object GDriveIcons {
             close()
         }.build()
     }
+}
+
+@Composable
+fun OnboardingScreen(onComplete: () -> Unit) {
+    var currentSlide by remember { mutableIntStateOf(0) }
+    val slides = listOf(
+        OnboardingSlide(
+            title = "Welcome to Replai ⚡",
+            description = "Your system-wide quick communication companion. Save template answers and reply to messages in seconds under any app!",
+            icon = Icons.Default.Email
+        ),
+        OnboardingSlide(
+            title = "Placeholders & Variables 💡",
+            description = "Insert variables like {name} or {amount} in your templates. When copying, Replai automatically prompts you to personalize them!",
+            icon = Icons.Default.Settings
+        ),
+        OnboardingSlide(
+            title = "Floating Bubble Quick-Access 🎈",
+            description = "Enable our floating quick-access bubble overlay to copy templates and insert pre-written replies directly without leaving your current app!",
+            icon = Icons.Default.Send
+        )
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(
+                imageVector = slides[currentSlide].icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(96.dp)
+            )
+            Spacer(modifier = Modifier.height(32.dp))
+            Text(
+                text = slides[currentSlide].title,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Black,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = slides[currentSlide].description,
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                textAlign = TextAlign.Center,
+                lineHeight = 20.sp,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
+            Spacer(modifier = Modifier.height(48.dp))
+            // Indicators
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                slides.forEachIndexed { index, _ ->
+                    Box(
+                        modifier = Modifier
+                            .size(if (index == currentSlide) 12.dp else 8.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (index == currentSlide) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.2f)
+                            )
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(48.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (currentSlide > 0) {
+                    TextButton(onClick = { currentSlide-- }) {
+                        Text("Back")
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(48.dp))
+                }
+                Button(
+                    onClick = {
+                        if (currentSlide < slides.lastIndex) {
+                            currentSlide++
+                        } else {
+                            onComplete()
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(if (currentSlide == slides.lastIndex) "Get Started 🚀" else "Next")
+                }
+            }
+        }
+    }
+}
+
+data class OnboardingSlide(
+    val title: String,
+    val description: String,
+    val icon: ImageVector
+)
+
+@Composable
+fun AdmobBanner(isProMode: Boolean) {
+    if (isProMode) return
+
+    val context = LocalContext.current
+    androidx.compose.ui.viewinterop.AndroidView(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .background(MaterialTheme.colorScheme.surfaceVariant),
+        factory = { ctx ->
+            com.google.android.gms.ads.AdView(ctx).apply {
+                setAdSize(com.google.android.gms.ads.AdSize.BANNER)
+                // Test banner ad ID
+                adUnitId = "ca-app-pub-3940256099942544/6300978111"
+                loadAd(com.google.android.gms.ads.AdRequest.Builder().build())
+            }
+        }
+    )
 }

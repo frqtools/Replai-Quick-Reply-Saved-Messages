@@ -31,6 +31,22 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     private val _replySortOrder = MutableStateFlow(prefs.getString("reply_sort_order", "usage") ?: "usage")
     val replySortOrder: StateFlow<String> = _replySortOrder.asStateFlow()
 
+    private val _onboardingCompleted = MutableStateFlow(prefs.getBoolean("onboarding_completed", false))
+    val onboardingCompleted: StateFlow<Boolean> = _onboardingCompleted.asStateFlow()
+
+    private val _isProMode = MutableStateFlow(prefs.getBoolean("is_pro_mode", false))
+    val isProMode: StateFlow<Boolean> = _isProMode.asStateFlow()
+
+    fun completeOnboarding() {
+        _onboardingCompleted.value = true
+        prefs.edit().putBoolean("onboarding_completed", true).apply()
+    }
+
+    fun setProMode(enabled: Boolean) {
+        _isProMode.value = enabled
+        prefs.edit().putBoolean("is_pro_mode", enabled).apply()
+    }
+
     fun setThemeMode(mode: String) {
         _themeMode.value = mode
         prefs.edit().putString("theme_mode", mode).apply()
@@ -440,22 +456,59 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
-    // Filtered replies flow based on search query and reply sort mode
-    val filteredReplies: StateFlow<List<Reply>> = combine(allReplies, _searchQuery, _replySortOrder) { replies, query, sort ->
+    // Filtered replies flow based on search query, category names and reply sort mode (with pinned on top)
+    val filteredReplies: StateFlow<List<Reply>> = combine(allReplies, categories, _searchQuery, _replySortOrder) { replies, cats, query, sort ->
         val filtered = if (query.isBlank()) {
             replies
         } else {
-            replies.filter {
-                it.title.contains(query, ignoreCase = true) ||
-                        it.content.contains(query, ignoreCase = true)
+            replies.filter { reply ->
+                reply.title.contains(query, ignoreCase = true) ||
+                        reply.content.contains(query, ignoreCase = true) ||
+                        cats.find { it.id == reply.categoryId }?.name?.contains(query, ignoreCase = true) == true
             }
         }
-        when (sort) {
+        val sorted = when (sort) {
             "alphabetical" -> filtered.sortedBy { it.title.lowercase() }
             "usage" -> filtered.sortedByDescending { it.usageCount }
             else -> filtered.sortedByDescending { it.id } // "recent" sorts by ID descending
         }
+        // Always place pinned replies first!
+        sorted.sortedByDescending { it.isPinned }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun togglePinReply(reply: Reply) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = reply.copy(isPinned = !reply.isPinned)
+            repository.updateReply(updated)
+            val msg = if (updated.isPinned) "Pinned '${reply.title}' to top" else "Unpinned '${reply.title}'"
+            _toastMessage.emit(msg)
+            markLocalUpdate()
+        }
+    }
+
+    fun duplicateReply(reply: Reply) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val duplicated = reply.copy(
+                id = 0, // auto-generate new ID
+                title = "${reply.title} (Copy)",
+                createdAt = System.currentTimeMillis(),
+                usageCount = 0,
+                isPinned = false
+            )
+            repository.insertReply(duplicated)
+            _toastMessage.emit("Duplicated template '${reply.title}'")
+            markLocalUpdate()
+        }
+    }
+
+    fun updateCategoryColor(category: Category, colorHex: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = category.copy(colorHex = colorHex)
+            repository.updateCategory(updated)
+            _toastMessage.emit("Updated category color")
+            markLocalUpdate()
+        }
+    }
 
     // UI Toast or Event notifications
     private val _toastMessage = MutableSharedFlow<String>()
@@ -472,18 +525,18 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // Category actions
-    fun addCategory(name: String, iconName: String, isForAi: Boolean = false) {
+    fun addCategory(name: String, iconName: String, isForAi: Boolean = false, colorHex: String = "#6200EE") {
         viewModelScope.launch(Dispatchers.IO) {
             val maxOrder = categories.value.maxOfOrNull { it.orderIndex } ?: 0
-            repository.insertCategory(Category(name = name, iconName = iconName, orderIndex = maxOrder + 1, isForAi = isForAi))
+            repository.insertCategory(Category(name = name, iconName = iconName, orderIndex = maxOrder + 1, isForAi = isForAi, colorHex = colorHex))
             _toastMessage.emit("Category '$name' created")
             markLocalUpdate()
         }
     }
 
-    fun updateCategory(category: Category, newName: String, newIcon: String, isForAi: Boolean) {
+    fun updateCategory(category: Category, newName: String, newIcon: String, isForAi: Boolean, colorHex: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.updateCategory(category.copy(name = newName, iconName = newIcon, isForAi = isForAi))
+            repository.updateCategory(category.copy(name = newName, iconName = newIcon, isForAi = isForAi, colorHex = colorHex))
             _toastMessage.emit("Category updated")
             markLocalUpdate()
         }
@@ -508,6 +561,13 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // Reply actions
+    fun checkForDuplicate(title: String, content: String): Boolean {
+        return allReplies.value.any {
+            it.title.trim().equals(title.trim(), ignoreCase = true) &&
+                    it.content.trim().equals(content.trim(), ignoreCase = true)
+        }
+    }
+
     fun addReply(categoryId: Long, title: String, content: String, isAiPrompt: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.insertReply(
@@ -565,7 +625,17 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
 
     fun incrementUsage(replyId: Long) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.incrementUsageCount(replyId)
+            val reply = allReplies.value.find { it.id == replyId }
+            if (reply != null) {
+                repository.updateReply(
+                    reply.copy(
+                        usageCount = reply.usageCount + 1,
+                        lastUsedAt = System.currentTimeMillis()
+                    )
+                )
+            } else {
+                repository.incrementUsageCount(replyId)
+            }
             markLocalUpdate()
         }
     }
@@ -781,6 +851,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 val catName = catObj.getString("name")
                 val catIcon = catObj.optString("iconName", "folder")
                 val catOrder = catObj.optInt("orderIndex", 0)
+                val catIsForAi = catObj.optBoolean("isForAi", false)
 
                 // Check if category already matches name
                 var category = database.categoryDao().getCategoryByName(catName)
@@ -788,7 +859,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     category.id
                 } else {
                     database.categoryDao().insertCategory(
-                        Category(name = catName, iconName = catIcon, orderIndex = catOrder)
+                        Category(name = catName, iconName = catIcon, orderIndex = catOrder, isForAi = catIsForAi)
                     )
                 }
 
