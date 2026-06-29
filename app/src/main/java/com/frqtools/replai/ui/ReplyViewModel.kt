@@ -3,6 +3,7 @@ package com.frqtools.replai.ui
 import android.app.Application
 import android.content.Context
 import android.util.Log
+import java.io.File
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.frqtools.replai.data.*
@@ -86,6 +87,140 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     private val _remoteUrlSyncStatus = MutableStateFlow(prefs.getString("remote_url_sync_status", "Not Connected") ?: "Not Connected")
     val remoteUrlSyncStatus: StateFlow<String> = _remoteUrlSyncStatus.asStateFlow()
 
+    // Local Device Backup Detection States
+    private val _detectedBackupContent = MutableStateFlow<String?>(null)
+    val detectedBackupContent: StateFlow<String?> = _detectedBackupContent.asStateFlow()
+
+    fun checkForLocalBackups() {
+        if (prefs.getBoolean("has_checked_initial_backup", false)) {
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            // Check private file in application storage
+            val privateFile = File(getApplication<Application>().filesDir, "replai_auto_backup.json")
+            if (privateFile.exists() && privateFile.canRead()) {
+                try {
+                    val content = privateFile.readText()
+                    if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
+                        _detectedBackupContent.value = content
+                        Log.d("LocalBackup", "Startup backup auto-detected in private filesDir")
+                        return@launch
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            // Check external files dir
+            val extDir = getApplication<Application>().getExternalFilesDir(null)
+            if (extDir != null) {
+                val extFile = File(extDir, "replai_auto_backup.json")
+                if (extFile.exists() && extFile.canRead()) {
+                    try {
+                        val content = extFile.readText()
+                        if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
+                            _detectedBackupContent.value = content
+                            Log.d("LocalBackup", "Startup backup auto-detected in externalFilesDir")
+                            return@launch
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+
+            // Check public Documents/ReplaiBackup directory
+            try {
+                val documentsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS)
+                val publicFile = File(File(documentsDir, "ReplaiBackup"), "replai_auto_backup.json")
+                if (publicFile.exists() && publicFile.canRead()) {
+                    val content = publicFile.readText()
+                    if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
+                        _detectedBackupContent.value = content
+                        Log.d("LocalBackup", "Startup backup auto-detected in public Documents/ReplaiBackup")
+                        return@launch
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            // Check public Downloads directory for default exported backup name
+            try {
+                val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                val publicFile = File(downloadsDir, "replai_backup_download.json")
+                if (publicFile.exists() && publicFile.canRead()) {
+                    val content = publicFile.readText()
+                    if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
+                        _detectedBackupContent.value = content
+                        Log.d("LocalBackup", "Startup backup auto-detected in public Downloads")
+                        return@launch
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun dismissLocalBackup() {
+        _detectedBackupContent.value = null
+        prefs.edit().putBoolean("has_checked_initial_backup", true).apply()
+    }
+
+    suspend fun clearAndRestoreFromJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            database.replyDao().deleteAllReplies()
+            database.categoryDao().deleteAllCategories()
+            val success = importFromJson(jsonString)
+            if (success) {
+                _detectedBackupContent.value = null
+                prefs.edit().putBoolean("has_checked_initial_backup", true).apply()
+            }
+            return@withContext success
+        } catch (e: Exception) {
+            Log.e("ReplyViewModel", "Clear and restore failed", e)
+            _toastMessage.emit("Failed to clear and restore backup")
+            return@withContext false
+        }
+    }
+
+    fun triggerLocalAutoBackup() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val json = exportToJson()
+                if (json.isNotBlank()) {
+                    // 1. Save to private app storage (survives app cache clearing/restarts)
+                    val privateBackupFile = File(getApplication<Application>().filesDir, "replai_auto_backup.json")
+                    privateBackupFile.writeText(json)
+
+                    // 2. Save to external files dir
+                    val extDir = getApplication<Application>().getExternalFilesDir(null)
+                    if (extDir != null) {
+                        val extBackupFile = File(extDir, "replai_auto_backup.json")
+                        extBackupFile.writeText(json)
+                    }
+
+                    // 3. Save to public Documents directory (so uninstalling/reinstalling allows checking)
+                    try {
+                        val documentsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS)
+                        val replaiDir = File(documentsDir, "ReplaiBackup")
+                        if (!replaiDir.exists()) {
+                            replaiDir.mkdirs()
+                        }
+                        val publicFile = File(replaiDir, "replai_auto_backup.json")
+                        publicFile.writeText(json)
+                        Log.d("LocalBackup", "Auto-backup safely synced to public documents folder.")
+                    } catch (e: Exception) {
+                        Log.e("LocalBackup", "Could not write to public storage", e)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("LocalBackup", "Failed to perform local auto-backup", e)
+            }
+        }
+    }
+
     fun setRemoteUrlSyncSettings(url: String, append: Boolean) {
         _remoteUrlSyncUrl.value = url.trim()
         _remoteUrlSyncAppend.value = append
@@ -109,6 +244,9 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
         val currentTime = System.currentTimeMillis()
         prefs.edit().putLong("gdrive_last_local_update_time", currentTime).apply()
         
+        // Trigger auto-backup inside offline device storage
+        triggerLocalAutoBackup()
+
         val syncUrl = _remoteUrlSyncUrl.value.trim()
         if (syncUrl.isNotBlank() && syncUrl.contains("script.google.com")) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -552,6 +690,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     init {
         viewModelScope.launch(Dispatchers.IO) {
             repository.seedDatabaseIfNeeded()
+            checkForLocalBackups()
         }
     }
 

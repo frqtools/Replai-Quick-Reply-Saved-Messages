@@ -580,6 +580,15 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
     private fun hideOverlay() {
         if (overlayView != null) {
             try {
+                if (overlayView is android.view.ViewGroup) {
+                    val vg = overlayView as android.view.ViewGroup
+                    for (i in 0 until vg.childCount) {
+                        val child = vg.getChildAt(i)
+                        if (child is ComposeView) {
+                            child.disposeComposition()
+                        }
+                    }
+                }
                 windowManager.removeView(overlayView)
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -700,14 +709,12 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         isRunning = false
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-        scope.cancel()
+        
+        // 1. Remove views first so they are detached from WindowManager and their compositions are disposed
         if (bubbleView != null) {
             try {
+                bubbleView?.disposeComposition()
                 windowManager.removeView(bubbleView)
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -715,5 +722,16 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
             bubbleView = null
         }
         hideOverlay()
+
+        // 2. Safely propagate lifecycle changes
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        
+        // 3. Cancel coroutines and clear resources
+        scope.cancel()
+        store.clear()
+        
+        super.onDestroy()
     }
 }

@@ -270,6 +270,56 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
     val aiPromptsListState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
+    // Create file launcher for native JSON export downloading
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        uri?.let {
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val exportString = viewModel.exportToJson()
+                    context.contentResolver.openOutputStream(it)?.use { outputStream ->
+                        outputStream.write(exportString.toByteArray(Charsets.UTF_8))
+                    }
+                    scope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                        Toast.makeText(context, "System backup exported successfully! 💾", Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    scope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                        Toast.makeText(context, "Export failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
+    // Open file launcher for native JSON import uploading
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let {
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    context.contentResolver.openInputStream(it)?.use { inputStream ->
+                        val jsonString = inputStream.bufferedReader().use { reader -> reader.readText() }
+                        val success = viewModel.importFromJson(jsonString)
+                        scope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                            if (success) {
+                                Toast.makeText(context, "Config loaded! Re-imported templates. ✅", Toast.LENGTH_LONG).show()
+                            } else {
+                                Toast.makeText(context, "Restoration failed. Invalid backup schema. ❌", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    scope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                        Toast.makeText(context, "Import failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
     // Multi-select templates state
     val selectedReplyIds = remember { mutableStateListOf<Long>() }
     var isMultiSelectMode by remember { mutableStateOf(false) }
@@ -339,9 +389,7 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
 
     Scaffold(
         bottomBar = {
-            val isProMode by viewModel.isProMode.collectAsState()
             Column(modifier = Modifier.fillMaxWidth()) {
-                AdmobBanner(isProMode)
                 NavigationBar(
                     containerColor = MaterialTheme.colorScheme.surface,
                     modifier = Modifier.fillMaxWidth().testTag("tabs_row")
@@ -429,9 +477,72 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
             )
 
             if (showCloudSyncDialog) {
-                CloudSyncDialog(
+                LocalBackupRestoreDialog(
                     viewModel = viewModel,
-                    onDismiss = { showCloudSyncDialog = false }
+                    onDismiss = { showCloudSyncDialog = false },
+                    onExportClick = {
+                        exportLauncher.launch("replai_backup_download.json")
+                    },
+                    onImportClick = {
+                        importLauncher.launch(arrayOf("application/json"))
+                    }
+                )
+            }
+
+            val detectedBackupContent by viewModel.detectedBackupContent.collectAsState()
+            if (detectedBackupContent != null) {
+                AlertDialog(
+                    onDismissRequest = { viewModel.dismissLocalBackup() },
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Share,
+                                contentDescription = "Backup found icon",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Restore Existing Backup?", fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                text = "We detected an existing offline backup of your saved replies and prompt categories on this device storage! 💾",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "Would you like to restore all your previous templates and categories? This is an offline restore and takes only 1 second.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    val success = viewModel.clearAndRestoreFromJson(detectedBackupContent!!)
+                                    if (success) {
+                                        Toast.makeText(context, "Welcome back! All data successfully restored! 🎉", Toast.LENGTH_LONG).show()
+                                    } else {
+                                        Toast.makeText(context, "Restore failed: invalid backup file.", Toast.LENGTH_LONG).show()
+                                    }
+                                    viewModel.dismissLocalBackup()
+                                }
+                            }
+                        ) {
+                            Text("Restore Backup 📥", fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { viewModel.dismissLocalBackup() }
+                        ) {
+                            Text("Skip / Clean Install")
+                        }
+                    }
                 )
             }
 
@@ -850,59 +961,49 @@ fun TopBrandHeader(
                 )
             }
 
-            // Cloud Sync Icon Button at top right
+            // Local Storage Backup Icon Button at top right
             IconButton(
                 onClick = onCloudClick,
                 modifier = Modifier
                     .size(44.dp)
                     .background(
-                        if (isConnected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                        else MaterialTheme.colorScheme.surfaceVariant,
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
                         shape = CircleShape
                     )
             ) {
-                if (isSyncing) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                } else {
-                    Icon(
-                        imageVector = if (isConnected) GDriveIcons.CloudDone else GDriveIcons.CloudQueue,
-                        contentDescription = "Cloud backup settings",
-                        tint = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.Share,
+                    contentDescription = "Storage backup settings",
+                    tint = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }
 }
 
 @Composable
-fun CloudSyncDialog(
+fun LocalBackupRestoreDialog(
     viewModel: ReplyViewModel,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onExportClick: () -> Unit,
+    onImportClick: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    
-    var selectedTab by remember { mutableStateOf(0) }
-    val tabs = listOf("Sheets Link", "Manual Backup")
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = GDriveIcons.Cloud,
-                    contentDescription = "Cloud backup",
+                    imageVector = Icons.Default.Share,
+                    contentDescription = "Backup icon",
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(28.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Backup & Template Sync",
+                    text = "Storage & Backups",
                     fontWeight = FontWeight.Bold,
                     fontSize = 18.sp
                 )
@@ -913,340 +1014,83 @@ fun CloudSyncDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                TabRow(
-                    selectedTabIndex = selectedTab,
-                    containerColor = Color.Transparent,
-                    contentColor = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                Text(
+                    text = "Replai works completely offline. All your templates are stored directly on your phone, keeping your data private and secure. No internet required!",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 16.sp
+                )
+
+                // WhatsApp-Style Automatic Backup Card
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    tabs.forEachIndexed { index, title ->
-                        Tab(
-                            selected = selectedTab == index,
-                            onClick = { selectedTab = index },
-                            text = { Text(title, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "📲 Real-Time Local Syncing",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "Every time you save, update, or reorganize a template, Replai instantly secures a copy inside your device's documents folder.\n\nIf you delete and reinstall Replai, the app will auto-detect this backup on startup and prompt to restore your complete data safely!",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 15.sp
                         )
                     }
                 }
 
-                when (selectedTab) {
-                    0 -> {
-                        // Google Sheets Link Import / Sync Tab
-                        val remoteUrl by viewModel.remoteUrlSyncUrl.collectAsState()
-                        val remoteAppend by viewModel.remoteUrlSyncAppend.collectAsState()
-                        val remoteLastSync by viewModel.remoteUrlLastSyncTime.collectAsState()
-                        val remoteStatus by viewModel.remoteUrlSyncStatus.collectAsState()
-
-                        var sheetUrlInput by remember { mutableStateOf(remoteUrl) }
-                        var appendDataInput by remember { mutableStateOf(remoteAppend) }
-                        var isRemoteSyncing by remember { mutableStateOf(false) }
-                        var showScriptSetup by remember { mutableStateOf(false) }
-
-                        val formattedRemoteLastSync = remember(remoteLastSync) {
-                            if (remoteLastSync == 0L) {
-                                "Never"
-                            } else {
-                                try {
-                                    val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
-                                    sdf.format(java.util.Date(remoteLastSync))
-                                } catch (e: Exception) {
-                                    "Unknown"
-                                }
-                            }
-                        }
-
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = "Keep your prompts synchronized and group-managed. Connect a Google Sheet URL for direct bidirectional synchronization.",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-
-                            // Setup Details Row Card / Box
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
-                                    .padding(8.dp)
-                            ) {
-                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                    Text("💡 Web App 2-Way Synchronization:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                                    Text("• Simple spreadsheet URLs are Read-Only.", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text("• Paste your Google Apps Script URL below to unlock seamless real-time Read, Write, and Delete sync!", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-
-                            OutlinedButton(
-                                onClick = { showScriptSetup = !showScriptSetup },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(if (showScriptSetup) "Hide Apps Script Setup Guide" else "Show Apps Script 2-Way Guide", fontSize = 11.sp)
-                            }
-
-                            if (showScriptSetup) {
-                                val scriptCode = """
-                                function doGet(e) {
-                                  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-                                  var data = sheet.getDataRange().getValues();
-                                  var result = [];
-                                  for (var i = 1; i < data.length; i++) {
-                                    var row = data[i];
-                                    if (row[0] && row[2]) {
-                                      result.push({
-                                        category: row[0].toString(),
-                                        title: row[1] ? row[1].toString() : "",
-                                        content: row[2].toString(),
-                                        isAi: (row[3] ? row[3].toString().toLowerCase() : "").indexOf("ai") !== -1
-                                      });
-                                    }
-                                  }
-                                  return ContentService.createTextOutput(JSON.stringify(result))
-                                    .setMimeType(ContentService.MimeType.JSON);
-                                }
-
-                                function doPost(e) {
-                                  var params = JSON.parse(e.postData.contents);
-                                  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-                                  sheet.clear();
-                                  sheet.appendRow(["Category", "Title", "Content", "Type"]);
-                                  for (var i = 0; i < params.length; i++) {
-                                    var item = params[i];
-                                    sheet.appendRow([item.category, item.title, item.content, item.isAi ? "ai" : "template"]);
-                                  }
-                                  return ContentService.createTextOutput(JSON.stringify({status: "success"}))
-                                    .setMimeType(ContentService.MimeType.JSON);
-                                }
-                                """.trimIndent()
-
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
-                                        .padding(8.dp),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Text("How to Install Web App:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                                    Text("1. Open your Google Sheet, click Extensions → Apps Script", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text("2. Replace default code with script below & save", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text("3. Click Deploy → New Deployment, select Web App", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text("4. Execute as: 'Me', Who has access: 'Anyone'", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text("5. Deploy, authorize access, copy Web App URL & paste below!", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(100.dp)
-                                            .background(MaterialTheme.colorScheme.background, RoundedCornerShape(4.dp))
-                                            .padding(6.dp)
-                                            .verticalScroll(rememberScrollState())
-                                    ) {
-                                        Text(
-                                            text = scriptCode,
-                                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                                            fontSize = 9.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-
-                                    Button(
-                                        onClick = {
-                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                            val clip = android.content.ClipData.newPlainText("Replai Apps Script", scriptCode)
-                                            clipboard.setPrimaryClip(clip)
-                                            Toast.makeText(context, "Apps Script copied! 📋", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier.align(Alignment.End)
-                                    ) {
-                                        Text("Copy Script Code", fontSize = 10.sp)
-                                    }
-                                }
-                            }
-
-                            OutlinedTextField(
-                                value = sheetUrlInput,
-                                onValueChange = { sheetUrlInput = it },
-                                label = { Text("Google Sheet or Apps Script Web App URL", fontSize = 11.sp) },
-                                placeholder = { Text("https://script.google.com/macros/s/... or Google Sheets URL", fontSize = 10.sp) },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = false,
-                                maxLines = 3,
-                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp)
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Checkbox(
-                                    checked = appendDataInput,
-                                    onCheckedChange = { appendDataInput = it }
-                                )
-                                Text(
-                                    text = "Consolidate previous local data into sheet",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
-                                    .padding(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                Text("Remote Link Status:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(remoteStatus, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-                                Text("Last Synchronization: $formattedRemoteLastSync", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Button(
-                                    onClick = {
-                                        viewModel.setRemoteUrlSyncSettings(sheetUrlInput, appendDataInput)
-                                        isRemoteSyncing = true
-                                        scope.launch {
-                                            viewModel.performBidirectionalSync(sheetUrlInput) { _, _ ->
-                                                isRemoteSyncing = false
-                                            }
-                                        }
-                                    },
-                                    modifier = Modifier.weight(1.5f),
-                                    enabled = !isRemoteSyncing && sheetUrlInput.isNotBlank()
-                                ) {
-                                    if (isRemoteSyncing) {
-                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
-                                    } else {
-                                        Icon(Icons.Default.Refresh, contentDescription = "Sync", modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Connect & Sync Now", fontSize = 11.sp)
-                                    }
-                                }
-
-                                OutlinedButton(
-                                    onClick = {
-                                        // Demo Sheet Link
-                                        sheetUrlInput = "https://docs.google.com/spreadsheets/d/1XlU-uR9i8tO4SclW_t7Yv9N8F78xQ56rS8J0pIDY4u8/edit?usp=sharing"
-                                        Toast.makeText(context, "Pasted standard demonstration template sheet!", Toast.LENGTH_SHORT).show()
-                                    },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Load Sample", fontSize = 11.sp)
-                                }
-                            }
-
-                            if (remoteUrl.isNotBlank()) {
-                                OutlinedButton(
-                                    onClick = {
-                                        viewModel.setRemoteUrlSyncSettings("", false)
-                                        Toast.makeText(context, "Disconnected safely. All data remains in the app! 🔓", Toast.LENGTH_SHORT).show()
-                                    },
-                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(Icons.Default.Delete, contentDescription = "Disconnect", modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Disconnect sheet but keep data", fontSize = 11.sp)
-                                }
-                            }
-                        }
+                // Quick Action Buttons
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    // Update Auto Backup Button
+                    Button(
+                        onClick = {
+                            viewModel.triggerLocalAutoBackup()
+                            Toast.makeText(context, "Backup updated at Documents/ReplaiBackup/replai_auto_backup.json! 💾", Toast.LENGTH_LONG).show()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Save", modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Save Auto-Backup to Phone", fontSize = 12.sp)
                     }
 
-                    1 -> {
-                        // Manual Copy-Paste Backup Tab
-                        var jsonPasteInput by remember { mutableStateOf("") }
+                    // Download Backup File Button
+                    OutlinedButton(
+                        onClick = {
+                            onExportClick()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = "Download backup file", modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Download Backup File (.json)", fontSize = 12.sp)
+                    }
 
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = "Export or restore your data offline without internet access. Copy the backup block as a safe text code and paste it to reload your templates on other platforms or devices.",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Button(
-                                    onClick = {
-                                        scope.launch {
-                                            val json = viewModel.exportToJson()
-                                            if (json.isNotBlank()) {
-                                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                                val clipData = android.content.ClipData.newPlainText("Replai Backup Data", json)
-                                                clipboardManager.setPrimaryClip(clipData)
-                                                Toast.makeText(context, "Full Backup copied to your Clipboard! 📋", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                Toast.makeText(context, "Export error: empty data", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(Icons.Default.Share, contentDescription = "Export raw data", modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Copy Active Backup to Clipboard", fontSize = 11.sp)
-                                }
-                            }
-
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-
-                            Text(
-                                text = "Paste Backup Payload to Restore:",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            OutlinedTextField(
-                                value = jsonPasteInput,
-                                onValueChange = { jsonPasteInput = it },
-                                placeholder = { Text("Paste your copied JSON code block here...", fontSize = 11.sp) },
-                                modifier = Modifier.fillMaxWidth().height(100.dp),
-                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 10.sp, fontFamily = FontFamily.Monospace),
-                                maxLines = 6,
-                                singleLine = false
-                            )
-
-                            Button(
-                                onClick = {
-                                    if (jsonPasteInput.isBlank()) {
-                                        Toast.makeText(context, "Please paste a backup JSON text block code first.", Toast.LENGTH_SHORT).show()
-                                        return@Button
-                                    }
-                                    scope.launch {
-                                        val success = viewModel.importFromJson(jsonPasteInput.trim())
-                                        if (success) {
-                                            Toast.makeText(context, "Backup successfully restored! 📱", Toast.LENGTH_SHORT).show()
-                                            jsonPasteInput = ""
-                                        }
-                                    }
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                enabled = jsonPasteInput.isNotBlank()
-                            ) {
-                                Icon(Icons.Default.Check, contentDescription = "Verify Restore", modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Verify & Overwrite Local Data", fontSize = 11.sp)
-                            }
-                        }
+                    // Restore Backup File Button
+                    OutlinedButton(
+                        onClick = {
+                            onImportClick()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Check, contentDescription = "Select & restore backup file", modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Restore Backup File from Phone", fontSize = 12.sp)
                     }
                 }
             }
         },
         confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("Close", fontWeight = FontWeight.Bold)
+                Text("Done", fontWeight = FontWeight.Bold)
             }
         }
     )
@@ -2082,107 +1926,35 @@ fun SettingsBackupTabContent(
 
                 Divider(modifier = Modifier.padding(vertical = 4.dp))
 
-                // Floating Overlay Configuration
+                // Offline Backup & Storage Settings Section
                 Column {
                     Text(
-                        text = "Quick-Access Overlay Bubble",
+                        text = "💾 Offline Storage & Backup",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Draws a floating bubble over other apps to let you copy template replies quickly without changing apps.",
+                        text = "Replai automatically secures your saved messages completely offline on your device storage. No cloud servers are used, meaning your data is 100% private.",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                         lineHeight = 15.sp
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
 
-                    val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        AndroidSettings.canDrawOverlays(context)
-                    } else {
-                        true
+                    Button(
+                        onClick = {
+                            viewModel.triggerLocalAutoBackup()
+                            Toast.makeText(context, "Backup updated at Documents/ReplaiBackup/replai_auto_backup.json! 💾", Toast.LENGTH_LONG).show()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Save", modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Save Auto-Backup to Phone", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
-
-                    if (!hasPermission) {
-                        Button(
-                            onClick = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                    val intent = Intent(
-                                        AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        Uri.parse("package:${context.packageName}")
-                                    )
-                                    context.startActivity(intent)
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Grant Overlay Permission 🔓", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                        }
-                    } else {
-                        val isBubbleEnabled = FloatingBubbleService.isRunningState.value
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = if (isBubbleEnabled) "Active Overlay Bubble 🟢" else "Overlay Bubble Disabled ⚪",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Switch(
-                                checked = isBubbleEnabled,
-                                onCheckedChange = { checked ->
-                                    val intent = Intent(context, FloatingBubbleService::class.java)
-                                    if (checked) {
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                            context.startForegroundService(intent)
-                                        } else {
-                                            context.startService(intent)
-                                        }
-                                    } else {
-                                        context.stopService(intent)
-                                    }
-                                }
-                            )
-                        }
-                    }
-                }
-
-                Divider(modifier = Modifier.padding(vertical = 4.dp))
-
-                // Simulate Pro Mode
-                val isProMode by viewModel.isProMode.collectAsState()
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Simulate Pro Mode 💎",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "Toggle this off to view the test AdMob banner, or toggle on to simulate ad-free premium mode.",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                            lineHeight = 15.sp
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Switch(
-                        checked = isProMode,
-                        onCheckedChange = { checked ->
-                            viewModel.setProMode(checked)
-                        }
-                    )
                 }
             }
         }
