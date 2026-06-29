@@ -104,9 +104,10 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
     override fun onCreate() {
         super.onCreate()
         isRunning = true
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
         savedStateRegistryController.performRestore(null)
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
@@ -235,7 +236,12 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
             y = 300
         }
 
-        windowManager.addView(bubbleView, bubbleParams)
+        try {
+            windowManager.addView(bubbleView, bubbleParams)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            stopSelf()
+        }
     }
 
     private fun toggleOverlay() {
@@ -564,12 +570,20 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
             gravity = Gravity.CENTER
         }
 
-        windowManager.addView(overlayView, overlayParams)
+        try {
+            windowManager.addView(overlayView, overlayParams)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     private fun hideOverlay() {
         if (overlayView != null) {
-            windowManager.removeView(overlayView)
+            try {
+                windowManager.removeView(overlayView)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
             overlayView = null
         }
     }
@@ -688,10 +702,16 @@ class FloatingBubbleService : Service(), LifecycleOwner, ViewModelStoreOwner, Sa
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         scope.cancel()
         if (bubbleView != null) {
-            windowManager.removeView(bubbleView)
+            try {
+                windowManager.removeView(bubbleView)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
             bubbleView = null
         }
         hideOverlay()
