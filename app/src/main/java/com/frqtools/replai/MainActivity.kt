@@ -65,7 +65,6 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import android.os.Build
 import android.provider.Settings as AndroidSettings
 import com.google.android.gms.ads.MobileAds
-import com.frqtools.replai.service.FloatingBubbleService
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.path
@@ -124,6 +123,10 @@ fun ReplaiApp(viewModel: ReplyViewModel = viewModel()) {
         viewModel.toastMessage.collectLatest { msg ->
             Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.checkForBackupOnFirstLaunch(context)
     }
 
     // Splash Timer
@@ -489,10 +492,11 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                 )
             }
 
-            val detectedBackupContent by viewModel.detectedBackupContent.collectAsState()
-            if (detectedBackupContent != null) {
+            val showRestorePrompt by viewModel.showRestorePrompt.collectAsState()
+            val backupDateString by viewModel.backupDateString.collectAsState()
+            if (showRestorePrompt) {
                 AlertDialog(
-                    onDismissRequest = { viewModel.dismissLocalBackup() },
+                    onDismissRequest = { viewModel.dismissRestorePrompt() },
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
@@ -502,18 +506,18 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                                 modifier = Modifier.size(28.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Restore Existing Backup?", fontWeight = FontWeight.Bold)
+                            Text("Restore Backup?", fontWeight = FontWeight.Bold)
                         }
                     },
                     text = {
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
-                                text = "We detected an existing offline backup of your saved replies and prompt categories on this device storage! 💾",
+                                text = "An automatic backup from $backupDateString was found on your device storage! 💾",
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Medium
                             )
                             Text(
-                                text = "Would you like to restore all your previous templates and categories? This is an offline restore and takes only 1 second.",
+                                text = "Would you like to restore your categories and replies to get all your templates back immediately?",
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -522,25 +526,17 @@ fun MainAppLayout(viewModel: ReplyViewModel) {
                     confirmButton = {
                         Button(
                             onClick = {
-                                scope.launch {
-                                    val success = viewModel.clearAndRestoreFromJson(detectedBackupContent!!)
-                                    if (success) {
-                                        Toast.makeText(context, "Welcome back! All data successfully restored! 🎉", Toast.LENGTH_LONG).show()
-                                    } else {
-                                        Toast.makeText(context, "Restore failed: invalid backup file.", Toast.LENGTH_LONG).show()
-                                    }
-                                    viewModel.dismissLocalBackup()
-                                }
+                                viewModel.restoreFromAutoBackup(context)
                             }
                         ) {
-                            Text("Restore Backup 📥", fontWeight = FontWeight.Bold)
+                            Text("Restore Backup", fontWeight = FontWeight.Bold)
                         }
                     },
                     dismissButton = {
                         TextButton(
-                            onClick = { viewModel.dismissLocalBackup() }
+                            onClick = { viewModel.dismissRestorePrompt() }
                         ) {
-                            Text("Skip / Clean Install")
+                            Text("Start Fresh")
                         }
                     }
                 )
@@ -914,10 +910,6 @@ fun TopBrandHeader(
     viewModel: ReplyViewModel,
     onCloudClick: () -> Unit
 ) {
-    val sheetUrl by viewModel.remoteUrlSyncUrl.collectAsState()
-    val isConnected = sheetUrl.isNotBlank()
-    val isSyncing by viewModel.isSyncing.collectAsState()
-
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -3556,11 +3548,6 @@ fun OnboardingScreen(onComplete: () -> Unit) {
             title = "Placeholders & Variables 💡",
             description = "Insert variables like {name} or {amount} in your templates. When copying, Replai automatically prompts you to personalize them!",
             icon = Icons.Default.Settings
-        ),
-        OnboardingSlide(
-            title = "Floating Bubble Quick-Access 🎈",
-            description = "Enable our floating quick-access bubble overlay to copy templates and insert pre-written replies directly without leaving your current app!",
-            icon = Icons.Default.Send
         )
     )
 

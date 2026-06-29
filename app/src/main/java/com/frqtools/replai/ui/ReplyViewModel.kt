@@ -4,6 +4,14 @@ import android.app.Application
 import android.content.Context
 import android.util.Log
 import java.io.File
+import android.content.ContentValues
+import android.net.Uri
+import android.content.ContentUris
+import android.provider.MediaStore
+import android.os.Build
+import android.os.Environment
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.frqtools.replai.data.*
@@ -35,17 +43,12 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     private val _onboardingCompleted = MutableStateFlow(prefs.getBoolean("onboarding_completed", false))
     val onboardingCompleted: StateFlow<Boolean> = _onboardingCompleted.asStateFlow()
 
-    private val _isProMode = MutableStateFlow(prefs.getBoolean("is_pro_mode", false))
+    private val _isProMode = MutableStateFlow(true)
     val isProMode: StateFlow<Boolean> = _isProMode.asStateFlow()
 
     fun completeOnboarding() {
         _onboardingCompleted.value = true
         prefs.edit().putBoolean("onboarding_completed", true).apply()
-    }
-
-    fun setProMode(enabled: Boolean) {
-        _isProMode.value = enabled
-        prefs.edit().putBoolean("is_pro_mode", enabled).apply()
     }
 
     fun setThemeMode(mode: String) {
@@ -63,550 +66,299 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putString("reply_sort_order", order).apply()
     }
 
-    // Sheet connection states
-    val isSyncing = MutableStateFlow(false)
+    // Modern WhatsApp-style Local Auto-Backup System States
+    private val _showRestorePrompt = MutableStateFlow(false)
+    val showRestorePrompt: StateFlow<Boolean> = _showRestorePrompt.asStateFlow()
 
-    // Data structure for Sheet row / entry
-    data class SheetRow(
-        val category: String,
-        val title: String,
-        val content: String,
-        val isAi: Boolean
-    )
+    private val _backupDateString = MutableStateFlow("")
+    val backupDateString: StateFlow<String> = _backupDateString.asStateFlow()
 
-    // Remote URL / Google Sheets Sync State Variables
-    private val _remoteUrlSyncUrl = MutableStateFlow(prefs.getString("remote_url_sync_url", "") ?: "")
-    val remoteUrlSyncUrl: StateFlow<String> = _remoteUrlSyncUrl.asStateFlow()
-
-    private val _remoteUrlSyncAppend = MutableStateFlow(prefs.getBoolean("remote_url_sync_append", false))
-    val remoteUrlSyncAppend: StateFlow<Boolean> = _remoteUrlSyncAppend.asStateFlow()
-
-    private val _remoteUrlLastSyncTime = MutableStateFlow(prefs.getLong("remote_url_last_sync_time", 0L))
-    val remoteUrlLastSyncTime: StateFlow<Long> = _remoteUrlLastSyncTime.asStateFlow()
-
-    private val _remoteUrlSyncStatus = MutableStateFlow(prefs.getString("remote_url_sync_status", "Not Connected") ?: "Not Connected")
-    val remoteUrlSyncStatus: StateFlow<String> = _remoteUrlSyncStatus.asStateFlow()
-
-    // Local Device Backup Detection States
     private val _detectedBackupContent = MutableStateFlow<String?>(null)
     val detectedBackupContent: StateFlow<String?> = _detectedBackupContent.asStateFlow()
 
-    fun checkForLocalBackups() {
-        if (prefs.getBoolean("has_checked_initial_backup", false)) {
+    private fun hasWritePermission(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true
+        return ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun getBackupUri(context: Context): Uri? {
+        val resolver = context.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            return null
+        }
+
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND (${MediaStore.MediaColumns.RELATIVE_PATH} = ? OR ${MediaStore.MediaColumns.RELATIVE_PATH} = ?)"
+        val selectionArgs = arrayOf("replai_auto_backup.json", "Documents/ReplaiBackup", "Documents/ReplaiBackup/")
+
+        try {
+            resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
+                    return ContentUris.withAppendedId(collection, id)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("Backup", "Error querying MediaStore for backup file", e)
+        }
+        return null
+    }
+
+    private fun saveAutoBackup(context: Context, jsonString: String): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = context.contentResolver
+            val existingUri = getBackupUri(context)
+            if (existingUri != null) {
+                try {
+                    resolver.openOutputStream(existingUri, "wt")?.use { os ->
+                        os.write(jsonString.toByteArray(Charsets.UTF_8))
+                    }
+                    return true
+                } catch (e: Exception) {
+                    Log.e("Backup", "Error overwriting existing MediaStore backup", e)
+                }
+            }
+
+            try {
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, "replai_auto_backup.json")
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Documents/ReplaiBackup")
+                }
+                val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                val newUri = resolver.insert(collection, contentValues)
+                if (newUri != null) {
+                    resolver.openOutputStream(newUri)?.use { os ->
+                        os.write(jsonString.toByteArray(Charsets.UTF_8))
+                    }
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.e("Backup", "Error inserting new MediaStore backup", e)
+            }
+        } else {
+            if (!hasWritePermission(context)) {
+                Log.w("Backup", "Write external storage permission not granted on API < 29, skipping backup.")
+                return false
+            }
+            try {
+                val documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                val backupDir = File(documentsDir, "ReplaiBackup")
+                if (!backupDir.exists()) {
+                    backupDir.mkdirs()
+                }
+                val backupFile = File(backupDir, "replai_auto_backup.json")
+                backupFile.writeText(jsonString)
+                return true
+            } catch (e: Exception) {
+                Log.e("Backup", "Error writing direct file backup on older SDK", e)
+            }
+        }
+        return false
+    }
+
+    private fun readAutoBackup(context: Context): String? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val uri = getBackupUri(context) ?: return null
+            try {
+                context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    return inputStream.bufferedReader().use { it.readText() }
+                }
+            } catch (e: Exception) {
+                Log.e("Backup", "Error reading MediaStore backup", e)
+            }
+        } else {
+            try {
+                val documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                val backupFile = File(File(documentsDir, "ReplaiBackup"), "replai_auto_backup.json")
+                if (backupFile.exists() && backupFile.canRead()) {
+                    return backupFile.readText()
+                }
+            } catch (e: Exception) {
+                Log.e("Backup", "Error reading direct file backup on older SDK", e)
+            }
+        }
+        return null
+    }
+
+    private suspend fun triggerAutoBackup() = withContext(Dispatchers.IO) {
+        try {
+            val categoriesList = database.categoryDao().getAllCategories().first()
+            val repliesList = database.replyDao().getAllReplies().first()
+
+            val root = JSONObject()
+            root.put("version", 1)
+            root.put("exportedAt", System.currentTimeMillis())
+
+            val categoriesArray = JSONArray()
+            categoriesList.forEach { category ->
+                val categoryObj = JSONObject()
+                categoryObj.put("id", category.id)
+                categoryObj.put("name", category.name)
+                categoryObj.put("iconName", category.iconName)
+                categoryObj.put("orderIndex", category.orderIndex)
+                categoryObj.put("isForAi", category.isForAi)
+                categoryObj.put("colorHex", category.colorHex)
+                categoriesArray.put(categoryObj)
+            }
+            root.put("categories", categoriesArray)
+
+            val repliesArray = JSONArray()
+            repliesList.forEach { reply ->
+                val replyObj = JSONObject()
+                replyObj.put("id", reply.id)
+                replyObj.put("categoryId", reply.categoryId)
+                replyObj.put("title", reply.title)
+                replyObj.put("content", reply.content)
+                replyObj.put("usageCount", reply.usageCount)
+                replyObj.put("isAiPrompt", reply.isAiPrompt)
+                replyObj.put("isPinned", reply.isPinned)
+                replyObj.put("createdAt", reply.createdAt)
+                replyObj.put("lastUsedAt", reply.lastUsedAt)
+                repliesArray.put(replyObj)
+            }
+            root.put("replies", repliesArray)
+
+            val jsonString = root.toString(2)
+            val context = getApplication<Application>()
+            saveAutoBackup(context, jsonString)
+        } catch (e: Exception) {
+            Log.e("AutoBackup", "Failed to write rolling backup", e)
+        }
+    }
+
+    fun checkForBackupOnFirstLaunch(context: Context) {
+        if (prefs.getBoolean("backup_restore_checked", false)) {
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
-            // Check private file in application storage
-            val privateFile = File(getApplication<Application>().filesDir, "replai_auto_backup.json")
-            if (privateFile.exists() && privateFile.canRead()) {
-                try {
-                    val content = privateFile.readText()
-                    if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
-                        _detectedBackupContent.value = content
-                        Log.d("LocalBackup", "Startup backup auto-detected in private filesDir")
-                        return@launch
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
+            try {
+                val catCount = database.categoryDao().getCategoryCount()
+                val repCount = database.replyDao().getReplyCount()
 
-            // Check external files dir
-            val extDir = getApplication<Application>().getExternalFilesDir(null)
-            if (extDir != null) {
-                val extFile = File(extDir, "replai_auto_backup.json")
-                if (extFile.exists() && extFile.canRead()) {
-                    try {
-                        val content = extFile.readText()
-                        if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
-                            _detectedBackupContent.value = content
-                            Log.d("LocalBackup", "Startup backup auto-detected in externalFilesDir")
+                if (catCount == 0 && repCount == 0) {
+                    val jsonString = readAutoBackup(context)
+                    if (jsonString != null) {
+                        val root = JSONObject(jsonString)
+                        val timestamp = root.optLong("exportedAt", 0L)
+                        if (timestamp > 0L) {
+                            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+                            _backupDateString.value = sdf.format(java.util.Date(timestamp))
+                            _showRestorePrompt.value = true
                             return@launch
                         }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
                     }
                 }
-            }
-
-            // Check public Documents/ReplaiBackup directory
-            try {
-                val documentsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS)
-                val publicFile = File(File(documentsDir, "ReplaiBackup"), "replai_auto_backup.json")
-                if (publicFile.exists() && publicFile.canRead()) {
-                    val content = publicFile.readText()
-                    if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
-                        _detectedBackupContent.value = content
-                        Log.d("LocalBackup", "Startup backup auto-detected in public Documents/ReplaiBackup")
-                        return@launch
-                    }
-                }
+                // If database has data or no backup found, check is complete.
+                prefs.edit().putBoolean("backup_restore_checked", true).apply()
             } catch (e: Exception) {
-                e.printStackTrace()
-            }
-
-            // Check public Downloads directory for default exported backup name
-            try {
-                val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
-                val publicFile = File(downloadsDir, "replai_backup_download.json")
-                if (publicFile.exists() && publicFile.canRead()) {
-                    val content = publicFile.readText()
-                    if (content.contains("\"app\":") && content.contains("\"Replai\"")) {
-                        _detectedBackupContent.value = content
-                        Log.d("LocalBackup", "Startup backup auto-detected in public Downloads")
-                        return@launch
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e("FirstLaunchCheck", "Failed to check for backup", e)
+                prefs.edit().putBoolean("backup_restore_checked", true).apply()
             }
         }
     }
 
-    fun dismissLocalBackup() {
-        _detectedBackupContent.value = null
-        prefs.edit().putBoolean("has_checked_initial_backup", true).apply()
-    }
-
-    suspend fun clearAndRestoreFromJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
-        try {
-            database.replyDao().deleteAllReplies()
-            database.categoryDao().deleteAllCategories()
-            val success = importFromJson(jsonString)
-            if (success) {
-                _detectedBackupContent.value = null
-                prefs.edit().putBoolean("has_checked_initial_backup", true).apply()
-            }
-            return@withContext success
-        } catch (e: Exception) {
-            Log.e("ReplyViewModel", "Clear and restore failed", e)
-            _toastMessage.emit("Failed to clear and restore backup")
-            return@withContext false
-        }
-    }
-
-    fun triggerLocalAutoBackup() {
+    fun restoreFromAutoBackup(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val json = exportToJson()
-                if (json.isNotBlank()) {
-                    // 1. Save to private app storage (survives app cache clearing/restarts)
-                    val privateBackupFile = File(getApplication<Application>().filesDir, "replai_auto_backup.json")
-                    privateBackupFile.writeText(json)
-
-                    // 2. Save to external files dir
-                    val extDir = getApplication<Application>().getExternalFilesDir(null)
-                    if (extDir != null) {
-                        val extBackupFile = File(extDir, "replai_auto_backup.json")
-                        extBackupFile.writeText(json)
+                val jsonString = readAutoBackup(context)
+                if (jsonString == null) {
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(context, "Backup file could not be read. Starting fresh.", android.widget.Toast.LENGTH_LONG).show()
                     }
-
-                    // 3. Save to public Documents directory (so uninstalling/reinstalling allows checking)
-                    try {
-                        val documentsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS)
-                        val replaiDir = File(documentsDir, "ReplaiBackup")
-                        if (!replaiDir.exists()) {
-                            replaiDir.mkdirs()
-                        }
-                        val publicFile = File(replaiDir, "replai_auto_backup.json")
-                        publicFile.writeText(json)
-                        Log.d("LocalBackup", "Auto-backup safely synced to public documents folder.")
-                    } catch (e: Exception) {
-                        Log.e("LocalBackup", "Could not write to public storage", e)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("LocalBackup", "Failed to perform local auto-backup", e)
-            }
-        }
-    }
-
-    fun setRemoteUrlSyncSettings(url: String, append: Boolean) {
-        _remoteUrlSyncUrl.value = url.trim()
-        _remoteUrlSyncAppend.value = append
-        prefs.edit()
-            .putString("remote_url_sync_url", url.trim())
-            .putBoolean("remote_url_sync_append", append)
-            .apply()
-    }
-
-    fun updateRemoteUrlSyncStatus(status: String) {
-        _remoteUrlSyncStatus.value = status
-        prefs.edit().putString("remote_url_sync_status", status).apply()
-    }
-
-    fun updateRemoteUrlLastSyncTime(timestamp: Long) {
-        _remoteUrlLastSyncTime.value = timestamp
-        prefs.edit().putLong("remote_url_last_sync_time", timestamp).apply()
-    }
-
-    private fun markLocalUpdate() {
-        val currentTime = System.currentTimeMillis()
-        prefs.edit().putLong("gdrive_last_local_update_time", currentTime).apply()
-        
-        // Trigger auto-backup inside offline device storage
-        triggerLocalAutoBackup()
-
-        val syncUrl = _remoteUrlSyncUrl.value.trim()
-        if (syncUrl.isNotBlank() && syncUrl.contains("script.google.com")) {
-            viewModelScope.launch(Dispatchers.IO) {
-                try {
-                    val localCategories = database.categoryDao().getAllCategories().first()
-                    val localReplies = database.replyDao().getAllReplies().first()
-                    val rows = localReplies.mapNotNull { reply ->
-                        localCategories.find { it.id == reply.categoryId }?.let { category ->
-                            SheetRow(
-                                category = category.name,
-                                title = reply.title,
-                                content = reply.content,
-                                isAi = reply.isAiPrompt
-                            )
-                        }
-                    }
-                    writeRemoteRows(syncUrl, rows)
-                } catch (e: Exception) {
-                    Log.e("SheetSync", "Auto-sync update failed", e)
-                }
-            }
-        }
-    }
-
-    private fun mergeRows(local: List<SheetRow>, remote: List<SheetRow>): List<SheetRow> {
-        val merged = mutableListOf<SheetRow>()
-        val seenKeys = mutableSetOf<String>()
-
-        // 1. Add remote rows
-        for (row in remote) {
-            val key = "${row.category.lowercase().trim()}|||${row.title.lowercase().trim()}|||${row.content.lowercase().trim()}"
-            if (!seenKeys.contains(key)) {
-                seenKeys.add(key)
-                merged.add(row)
-            }
-        }
-
-        // 2. Add local rows that are not in remote
-        for (row in local) {
-            val key = "${row.category.lowercase().trim()}|||${row.title.lowercase().trim()}|||${row.content.lowercase().trim()}"
-            if (!seenKeys.contains(key)) {
-                seenKeys.add(key)
-                merged.add(row)
-            }
-        }
-        return merged
-    }
-
-    private suspend fun fetchRemoteRows(url: String): List<SheetRow> {
-        var downloadUrl = url.trim()
-        val client = okhttp3.OkHttpClient.Builder()
-            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
-
-        if (downloadUrl.contains("docs.google.com/spreadsheets")) {
-            val regex = "/d/([a-zA-Z0-9-_]+)".toRegex()
-            val match = regex.find(downloadUrl)
-            val sheetId = match?.groups?.get(1)?.value
-            if (sheetId != null) {
-                downloadUrl = "https://docs.google.com/spreadsheets/d/$sheetId/export?format=csv"
-            }
-        }
-
-        val request = okhttp3.Request.Builder().url(downloadUrl).build()
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw Exception("HTTP Error ${response.code}")
-            }
-            val body = response.body?.string() ?: return emptyList()
-            val trimmedBody = body.trim()
-
-            if (trimmedBody.startsWith("[") || trimmedBody.startsWith("{")) {
-                val list = mutableListOf<SheetRow>()
-                try {
-                    val jsonArray = if (trimmedBody.startsWith("{")) {
-                        val obj = JSONObject(trimmedBody)
-                        obj.optJSONArray("data") ?: JSONArray()
-                    } else {
-                        JSONArray(trimmedBody)
-                    }
-
-                    for (i in 0 until jsonArray.length()) {
-                        val obj = jsonArray.getJSONObject(i)
-                        val cat = obj.optString("category", "").trim()
-                        val title = obj.optString("title", "").trim()
-                        val content = obj.optString("content", "").trim()
-                        val isAi = obj.optBoolean("isAi", false) || 
-                                   obj.optString("type", "").lowercase().contains("ai") ||
-                                   obj.optBoolean("isAiPrompt", false)
-                        if (cat.isNotEmpty() && content.isNotEmpty()) {
-                            list.add(SheetRow(category = cat, title = title, content = content, isAi = isAi))
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("SheetSync", "Parse response JSON failure", e)
-                }
-                return list
-            } else {
-                val records = parseFullCsv(body)
-                if (records.isEmpty()) return emptyList()
-
-                var categoryIndex = 0
-                var titleIndex = -1
-                var contentIndex = -1
-                var isAiIndex = -1
-
-                val firstRecord = records[0]
-                var hasHeader = false
-                if (firstRecord.any { it.equals("category", ignoreCase = true) || it.equals("title", ignoreCase = true) || it.equals("content", ignoreCase = true) }) {
-                    hasHeader = true
-                    categoryIndex = firstRecord.indexOfFirst { it.equals("category", ignoreCase = true) }.coerceAtLeast(0)
-                    titleIndex = firstRecord.indexOfFirst { it.equals("title", ignoreCase = true) }
-                    contentIndex = firstRecord.indexOfFirst { it.equals("content", ignoreCase = true) }
-                    isAiIndex = firstRecord.indexOfFirst { it.equals("type", ignoreCase = true) || it.equals("isai", ignoreCase = true) || it.equals("is_ai", ignoreCase = true) || it.equals("isaiprompt", ignoreCase = true) }
+                    dismissRestorePrompt()
+                    return@launch
                 }
 
-                if (titleIndex == -1) titleIndex = 1
-                if (contentIndex == -1) contentIndex = 2
-                if (isAiIndex == -1) isAiIndex = 3
+                val root = JSONObject(jsonString)
+                val categoriesArray = root.getJSONArray("categories")
+                val repliesArray = root.getJSONArray("replies")
 
-                val startRow = if (hasHeader) 1 else 0
-                val list = mutableListOf<SheetRow>()
+                database.replyDao().deleteAllReplies()
+                database.categoryDao().deleteAllCategories()
 
-                for (idx in startRow until records.size) {
-                    val cells = records[idx]
-                    if (cells.size <= 1) continue
+                for (i in 0 until categoriesArray.length()) {
+                    val catObj = categoriesArray.getJSONObject(i)
+                    val catId = catObj.getLong("id")
+                    val catName = catObj.getString("name")
+                    val catIcon = catObj.optString("iconName", "folder")
+                    val catOrder = catObj.optInt("orderIndex", 0)
+                    val catIsForAi = catObj.optBoolean("isForAi", false)
+                    val catColorHex = catObj.optString("colorHex", "#6200EE")
 
-                    val categoryName = cells.getOrNull(categoryIndex)?.trim() ?: ""
-                    val title = cells.getOrNull(titleIndex)?.trim() ?: "Template $idx"
-                    val content = cells.getOrNull(contentIndex)?.trim() ?: ""
-                    val isAiVal = if (isAiIndex >= 0) cells.getOrNull(isAiIndex)?.trim() else null
-                    val isAi = isAiVal?.equals("true", ignoreCase = true) == true || 
-                               isAiVal?.equals("ai", ignoreCase = true) == true || 
-                               isAiVal?.equals("1") == true
-
-                    if (categoryName.isNotBlank() && content.isNotBlank()) {
-                        list.add(SheetRow(category = categoryName, title = title, content = content, isAi = isAi))
-                    }
-                }
-                return list
-            }
-        }
-    }
-
-    private suspend fun writeRemoteRows(url: String, rows: List<SheetRow>): Boolean {
-        if (!url.contains("script.google.com")) return false
-        val client = okhttp3.OkHttpClient.Builder()
-            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
-
-        val jsonArray = JSONArray()
-        for (row in rows) {
-            val obj = JSONObject()
-            obj.put("category", row.category)
-            obj.put("title", row.title)
-            obj.put("content", row.content)
-            obj.put("isAi", row.isAi)
-            obj.put("type", if (row.isAi) "ai" else "template")
-            jsonArray.put(obj)
-        }
-
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val body = jsonArray.toString().toRequestBody(mediaType)
-
-        val request = okhttp3.Request.Builder()
-            .url(url)
-            .post(body)
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                response.isSuccessful
-            }
-        } catch (e: Exception) {
-            Log.e("SheetSync", "Failed to upload sheet rows", e)
-            false
-        }
-    }
-
-    suspend fun performBidirectionalSync(forceUrl: String? = null, onFinished: ((Boolean, String) -> Unit)? = null) = withContext(Dispatchers.IO) {
-        val syncUrl = forceUrl ?: _remoteUrlSyncUrl.value.trim()
-        if (syncUrl.isBlank()) {
-            updateRemoteUrlSyncStatus("Config Error: Sync URL is empty.")
-            onFinished?.invoke(false, "Sync URL is empty")
-            return@withContext
-        }
-
-        if (isSyncing.value) {
-            onFinished?.invoke(false, "Sync already in progress")
-            return@withContext
-        }
-        isSyncing.value = true
-        updateRemoteUrlSyncStatus("Synchronizing...")
-
-        try {
-            // 1. Get all local data
-            val localCategories = database.categoryDao().getAllCategories().first()
-            val localReplies = database.replyDao().getAllReplies().first()
-            
-            val localRows = localReplies.mapNotNull { reply ->
-                localCategories.find { it.id == reply.categoryId }?.let { category ->
-                    SheetRow(
-                        category = category.name,
-                        title = reply.title,
-                        content = reply.content,
-                        isAi = reply.isAiPrompt
-                    )
-                }
-            }
-
-            // 2. Fetch remote data
-            val remoteRows = fetchRemoteRows(syncUrl)
-
-            // 3. Bidirectional merge (preventing washouts!)
-            val append = _remoteUrlSyncAppend.value
-            val mergedRows = if (append) {
-                mergeRows(localRows, remoteRows)
-            } else {
-                // If append is false, we still don't washout! We just consolidate them both ways.
-                mergeRows(localRows, remoteRows)
-            }
-
-            // Create snapshots of existing categories' colors and icons
-            val categoryColorMap = localCategories.associate { 
-                it.name.lowercase().trim() to it.colorHex 
-            }
-            val categoryIconMap = localCategories.associate { 
-                it.name.lowercase().trim() to it.iconName 
-            }
-
-            // Create snapshots of existing replies' pins, lastUsedAt, and usageCount
-            // We uniquely identify a reply by the combination of category_name, title, and content
-            val replyPinMap = mutableMapOf<String, Boolean>()
-            val replyLastUsedMap = mutableMapOf<String, Long>()
-            val replyUsageCountMap = mutableMapOf<String, Int>()
-
-            localReplies.forEach { reply ->
-                val categoryName = localCategories.find { it.id == reply.categoryId }?.name ?: ""
-                val uniqueKey = "${categoryName.lowercase().trim()}|${reply.title.lowercase().trim()}|${reply.content.lowercase().trim()}"
-                replyPinMap[uniqueKey] = reply.isPinned
-                replyLastUsedMap[uniqueKey] = reply.lastUsedAt
-                replyUsageCountMap[uniqueKey] = reply.usageCount
-            }
-
-            // 4. Update the local Room database to match
-            database.replyDao().deleteAllReplies()
-            database.categoryDao().deleteAllCategories()
-
-            val createdCategories = mutableMapOf<String, Long>()
-            var orderIdx = 0
-            for (row in mergedRows) {
-                val catKey = row.category.lowercase().trim()
-                var categoryId = createdCategories[catKey]
-                if (categoryId == null) {
-                    val existingColor = categoryColorMap[catKey] ?: "#6200EE"
-                    val existingIcon = categoryIconMap[catKey] ?: (if (row.isAi) "psychology" else "folder")
-                    categoryId = database.categoryDao().insertCategory(
+                    database.categoryDao().insertCategory(
                         Category(
-                            name = row.category.trim(),
-                            iconName = existingIcon,
-                            orderIndex = orderIdx++,
-                            isForAi = row.isAi,
-                            colorHex = existingColor
+                            id = catId,
+                            name = catName,
+                            iconName = catIcon,
+                            orderIndex = catOrder,
+                            isForAi = catIsForAi,
+                            colorHex = catColorHex
                         )
                     )
-                    createdCategories[catKey] = categoryId
                 }
-                
-                val replyKey = "${row.category.lowercase().trim()}|${row.title.lowercase().trim()}|${row.content.lowercase().trim()}"
-                val isPinned = replyPinMap[replyKey] ?: false
-                val lastUsedAt = replyLastUsedMap[replyKey] ?: 0L
-                val usageCount = replyUsageCountMap[replyKey] ?: 0
 
-                database.replyDao().insertReply(
-                    Reply(
-                        categoryId = categoryId,
-                        title = row.title.trim(),
-                        content = row.content.trim(),
-                        isAiPrompt = row.isAi,
-                        isPinned = isPinned,
-                        lastUsedAt = lastUsedAt,
-                        usageCount = usageCount
-                    )
-                )
-            }
-
-            // 5. If it is a script.google.com URL, push the merged dataset back to Sheets
-            var uploaded = false
-            if (syncUrl.contains("script.google.com")) {
-                uploaded = writeRemoteRows(syncUrl, mergedRows)
-            }
-
-            val timestamp = System.currentTimeMillis()
-            updateRemoteUrlLastSyncTime(timestamp)
-            val statusText = if (uploaded) {
-                "Synced bi-directionally (${mergedRows.size} total items)"
-            } else {
-                "Synced (Read-only, ${mergedRows.size} total items)"
-            }
-            updateRemoteUrlSyncStatus(statusText)
-            _toastMessage.emit("Sync complete! Consolidated ${mergedRows.size} items. 🚀")
-            onFinished?.invoke(true, statusText)
-        } catch (e: Exception) {
-            Log.e("SheetSync", "Failed to sync", e)
-            val errMsg = "Failed: ${e.message}"
-            updateRemoteUrlSyncStatus(errMsg)
-            onFinished?.invoke(false, errMsg)
-        } finally {
-            isSyncing.value = false
-        }
-    }
-
-    suspend fun restoreDatabaseFromJson(jsonString: String): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val root = JSONObject(jsonString)
-            if (!root.has("app") || root.getString("app") != "Replai") {
-                return@withContext false
-            }
-
-            // Clear out replies and categories for an exact sync override
-            database.replyDao().deleteAllReplies()
-            database.categoryDao().deleteAllCategories()
-
-            val dataArray = root.getJSONArray("data")
-            for (i in 0 until dataArray.length()) {
-                val catObj = dataArray.getJSONObject(i)
-                val catName = catObj.getString("name")
-                val catIcon = catObj.optString("iconName", "folder")
-                val catOrder = catObj.optInt("orderIndex", 0)
-                val catIsForAi = catObj.optBoolean("isForAi", false)
-
-                val categoryId = database.categoryDao().insertCategory(
-                    Category(name = catName, iconName = catIcon, orderIndex = catOrder, isForAi = catIsForAi)
-                )
-
-                val repliesArray = catObj.getJSONArray("replies")
-                for (j in 0 until repliesArray.length()) {
-                    val replyObj = repliesArray.getJSONObject(j)
+                for (i in 0 until repliesArray.length()) {
+                    val replyObj = repliesArray.getJSONObject(i)
+                    val rId = replyObj.getLong("id")
+                    val rCategoryId = replyObj.getLong("categoryId")
                     val rTitle = replyObj.getString("title")
                     val rContent = replyObj.getString("content")
                     val rCount = replyObj.optInt("usageCount", 0)
                     val rIsAi = replyObj.optBoolean("isAiPrompt", false)
+                    val rIsPinned = replyObj.optBoolean("isPinned", false)
+                    val rCreatedAt = replyObj.optLong("createdAt", System.currentTimeMillis())
+                    val rLastUsedAt = replyObj.optLong("lastUsedAt", 0L)
 
                     database.replyDao().insertReply(
                         Reply(
-                            categoryId = categoryId,
+                            id = rId,
+                            categoryId = rCategoryId,
                             title = rTitle,
                             content = rContent,
                             usageCount = rCount,
-                            isAiPrompt = rIsAi
+                            isAiPrompt = rIsAi,
+                            isPinned = rIsPinned,
+                            createdAt = rCreatedAt,
+                            lastUsedAt = rLastUsedAt
                         )
                     )
                 }
+
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(
+                        context,
+                        "Backup restored! ${repliesArray.length()} templates across ${categoriesArray.length()} categories loaded.",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            } catch (e: Exception) {
+                Log.e("RestoreBackup", "Error restoring backup", e)
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(context, "Backup file could not be read. Starting fresh.", android.widget.Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                dismissRestorePrompt()
             }
-            return@withContext true
-        } catch (e: Exception) {
-            Log.e("ReplyViewModel", "Restore failed", e)
-            return@withContext false
+        }
+    }
+
+    fun dismissRestorePrompt() {
+        _showRestorePrompt.value = false
+        prefs.edit().putBoolean("backup_restore_checked", true).apply()
+    }
+
+    fun triggerLocalAutoBackup() {
+        viewModelScope.launch(Dispatchers.IO) {
+            triggerAutoBackup()
+        }
+    }
+
+    private fun markLocalUpdate() {
+        viewModelScope.launch(Dispatchers.IO) {
+            triggerAutoBackup()
         }
     }
 
@@ -690,7 +442,6 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     init {
         viewModelScope.launch(Dispatchers.IO) {
             repository.seedDatabaseIfNeeded()
-            checkForLocalBackups()
         }
     }
 
