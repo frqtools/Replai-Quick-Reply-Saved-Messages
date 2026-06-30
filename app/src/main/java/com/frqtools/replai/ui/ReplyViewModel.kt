@@ -89,15 +89,20 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
             return null
         }
 
-        val projection = arrayOf(MediaStore.MediaColumns._ID)
-        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND (${MediaStore.MediaColumns.RELATIVE_PATH} = ? OR ${MediaStore.MediaColumns.RELATIVE_PATH} = ?)"
-        val selectionArgs = arrayOf("replai_auto_backup.json", "Documents/ReplaiBackup", "Documents/ReplaiBackup/")
+        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH)
+        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
+        val selectionArgs = arrayOf("replai_auto_backup.json")
 
         try {
             resolver.query(collection, projection, selection, selectionArgs, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
-                    return ContentUris.withAppendedId(collection, id)
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                val pathColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val relativePath = cursor.getString(pathColumn)
+                    if (relativePath != null && relativePath.contains("Documents/ReplaiBackup", ignoreCase = true)) {
+                        return ContentUris.withAppendedId(collection, id)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -241,6 +246,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 if (catCount == 0 && repCount == 0) {
                     val jsonString = readAutoBackup(context)
                     if (jsonString != null) {
+                        _detectedBackupContent.value = jsonString
                         val root = JSONObject(jsonString)
                         val timestamp = root.optLong("exportedAt", 0L)
                         if (timestamp > 0L) {
@@ -250,6 +256,8 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                             return@launch
                         }
                     }
+                    // No backup exists, and database is empty -> seed default templates
+                    repository.seedDatabaseIfNeeded()
                 }
                 // If database has data or no backup found, check is complete.
                 prefs.edit().putBoolean("backup_restore_checked", true).apply()
@@ -263,7 +271,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     fun restoreFromAutoBackup(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val jsonString = readAutoBackup(context)
+                val jsonString = _detectedBackupContent.value ?: readAutoBackup(context)
                 if (jsonString == null) {
                     withContext(Dispatchers.Main) {
                         android.widget.Toast.makeText(context, "Backup file could not be read. Starting fresh.", android.widget.Toast.LENGTH_LONG).show()
@@ -348,6 +356,12 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     fun dismissRestorePrompt() {
         _showRestorePrompt.value = false
         prefs.edit().putBoolean("backup_restore_checked", true).apply()
+        viewModelScope.launch(Dispatchers.IO) {
+            val catCount = database.categoryDao().getCategoryCount()
+            if (catCount == 0) {
+                repository.seedDatabaseIfNeeded()
+            }
+        }
     }
 
     fun triggerLocalAutoBackup() {
@@ -441,7 +455,13 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.seedDatabaseIfNeeded()
+            val alreadyChecked = prefs.getBoolean("backup_restore_checked", false)
+            val catCount = database.categoryDao().getCategoryCount()
+            if (!alreadyChecked && catCount == 0) {
+                // Backup check will happen in checkForBackupOnFirstLaunch — don't seed yet
+            } else {
+                repository.seedDatabaseIfNeeded()
+            }
         }
     }
 
