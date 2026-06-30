@@ -5,15 +5,15 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <include domain="sharedpref" path="replai_settings.xml" />
+        <include domain="database" path="replai_database" />
+        <include domain="database" path="replai_database-shm" />
+        <include domain="database" path="replai_database-wal" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <include domain="sharedpref" path="replai_settings.xml" />
+        <include domain="database" path="replai_database" />
+        <include domain="database" path="replai_database-shm" />
+        <include domain="database" path="replai_database-wal" />
     </device-transfer>
-    -->
 </data-extraction-rules>

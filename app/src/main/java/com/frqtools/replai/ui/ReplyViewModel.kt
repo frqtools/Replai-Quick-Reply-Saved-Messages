@@ -193,15 +193,24 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
     private fun parseJsonToData(jsonString: String): Pair<List<Category>, List<Reply>>? {
         try {
             val root = JSONObject(jsonString)
+            val exportedAt = root.optLong("exportedAt", -1L)
+            if (exportedAt <= 0L) {
+                Log.w("ReplyViewModel", "Invalid or missing exportedAt timestamp in backup JSON.")
+                return null
+            }
             if (root.has("data") && !root.has("categories")) {
                 val categoriesList = mutableListOf<Category>()
                 val repliesList = mutableListOf<Reply>()
                 val dataArray = root.getJSONArray("data")
+                if (dataArray.length() == 0) {
+                    return null
+                }
                 var categoryTempId = 1L
                 var replyTempId = 1L
                 for (i in 0 until dataArray.length()) {
                     val catObj = dataArray.getJSONObject(i)
-                    val catName = catObj.getString("name")
+                    val catName = catObj.optString("name", "")
+                    if (catName.isEmpty()) continue
                     val catIcon = catObj.optString("iconName", "folder")
                     val catOrder = catObj.optInt("orderIndex", 0)
                     val catIsForAi = catObj.optBoolean("isForAi", false)
@@ -220,8 +229,9 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     val repliesArray = catObj.optJSONArray("replies") ?: JSONArray()
                     for (j in 0 until repliesArray.length()) {
                         val replyObj = repliesArray.getJSONObject(j)
-                        val rTitle = replyObj.getString("title")
-                        val rContent = replyObj.getString("content")
+                        val rTitle = replyObj.optString("title", "")
+                        val rContent = replyObj.optString("content", "")
+                        if (rTitle.isEmpty() || rContent.isEmpty()) continue
                         val rCount = replyObj.optInt("usageCount", 0)
                         val rIsAi = replyObj.optBoolean("isAiPrompt", false) || replyObj.optBoolean("isAi", false)
                         val rIsPinned = replyObj.optBoolean("isPinned", false)
@@ -242,6 +252,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 }
+                if (categoriesList.isEmpty()) return null
                 return Pair(categoriesList, repliesList)
             } else {
                 val categoriesArray = root.optJSONArray("categories") ?: JSONArray()
@@ -253,7 +264,8 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 for (i in 0 until categoriesArray.length()) {
                     val catObj = categoriesArray.getJSONObject(i)
                     val catId = catObj.optLong("id", (i + 1).toLong())
-                    val catName = catObj.getString("name")
+                    val catName = catObj.optString("name", "")
+                    if (catName.isEmpty()) continue
                     val catIcon = catObj.optString("iconName", "folder")
                     val catOrder = catObj.optInt("orderIndex", 0)
                     val catIsForAi = catObj.optBoolean("isForAi", false)
@@ -273,9 +285,11 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                 for (i in 0 until repliesArray.length()) {
                     val replyObj = repliesArray.getJSONObject(i)
                     val rId = replyObj.optLong("id", (i + 1).toLong())
-                    val rCategoryId = replyObj.getLong("categoryId")
-                    val rTitle = replyObj.getString("title")
-                    val rContent = replyObj.getString("content")
+                    val rCategoryId = replyObj.optLong("categoryId", -1L)
+                    if (rCategoryId == -1L) continue
+                    val rTitle = replyObj.optString("title", "")
+                    val rContent = replyObj.optString("content", "")
+                    if (rTitle.isEmpty() || rContent.isEmpty()) continue
                     val rCount = replyObj.optInt("usageCount", 0)
                     val rIsAi = replyObj.optBoolean("isAiPrompt", false) || replyObj.optBoolean("isAi", false)
                     val rIsPinned = replyObj.optBoolean("isPinned", false)
@@ -295,6 +309,7 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     )
                 }
+                if (categoriesList.isEmpty()) return null
                 return Pair(categoriesList, repliesList)
             }
         } catch (e: Exception) {
@@ -367,17 +382,16 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     if (jsonString != null) {
                         val parsed = parseJsonToData(jsonString)
                         if (parsed != null) {
-                            val root = JSONObject(jsonString)
-                            val timestamp = root.optLong("exportedAt", 0L)
-                            _detectedBackupContent.value = jsonString
-                            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-                            val dateStr = if (timestamp > 0L) {
-                                sdf.format(java.util.Date(timestamp))
-                            } else {
-                                "Unknown Date"
+                            val (categories, replies) = parsed
+                            database.restoreFromBackup(categories, replies)
+                            withContext(Dispatchers.Main) {
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Backup automatically restored! ${replies.size} templates across ${categories.size} categories loaded. 💾",
+                                    android.widget.Toast.LENGTH_LONG
+                                ).show()
                             }
-                            _backupDateString.value = dateStr
-                            _showRestorePrompt.value = true
+                            prefs.edit().putBoolean("backup_restore_checked", true).apply()
                             return@launch
                         }
                     }
@@ -405,7 +419,6 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     withContext(Dispatchers.Main) {
                         android.widget.Toast.makeText(context, "Backup file could not be read. Starting fresh.", android.widget.Toast.LENGTH_LONG).show()
                     }
-                    dismissRestorePrompt()
                     return@launch
                 }
 
@@ -414,7 +427,6 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
                     withContext(Dispatchers.Main) {
                         android.widget.Toast.makeText(context, "Backup file could not be parsed. Starting fresh.", android.widget.Toast.LENGTH_LONG).show()
                     }
-                    dismissRestorePrompt()
                     return@launch
                 }
 
@@ -880,45 +892,9 @@ class ReplyViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val (categories, replies) = parsed
-            val categoryIdMap = mutableMapOf<Long, Long>()
+            database.restoreFromBackup(categories, replies)
 
-            for (cat in categories) {
-                val existingCategory = database.categoryDao().getCategoryByName(cat.name)
-                val dbCategoryId = if (existingCategory != null) {
-                    existingCategory.id
-                } else {
-                    database.categoryDao().insertCategory(
-                        Category(
-                            name = cat.name,
-                            iconName = cat.iconName,
-                            orderIndex = cat.orderIndex,
-                            isForAi = cat.isForAi,
-                            colorHex = cat.colorHex
-                        )
-                    )
-                }
-                categoryIdMap[cat.id] = dbCategoryId
-            }
-
-            var importedCount = 0
-            for (reply in replies) {
-                val dbCategoryId = categoryIdMap[reply.categoryId] ?: continue
-                database.replyDao().insertReply(
-                    Reply(
-                        categoryId = dbCategoryId,
-                        title = reply.title,
-                        content = reply.content,
-                        usageCount = reply.usageCount,
-                        isAiPrompt = reply.isAiPrompt,
-                        isPinned = reply.isPinned,
-                        createdAt = reply.createdAt,
-                        lastUsedAt = reply.lastUsedAt
-                    )
-                )
-                importedCount++
-            }
-
-            _toastMessage.emit("Backup imported successfully! Loaded $importedCount templates.")
+            _toastMessage.emit("Backup restored successfully! Loaded ${replies.size} templates across ${categories.size} categories. ✅")
             return@withContext true
         } catch (e: Exception) {
             Log.e("ReplyViewModel", "Import failed", e)
